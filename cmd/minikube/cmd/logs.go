@@ -21,6 +21,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
+	"k8s.io/klog/v2"
 	cmdcfg "k8s.io/minikube/cmd/minikube/cmd/config"
 	"k8s.io/minikube/pkg/minikube/cluster"
 	"k8s.io/minikube/pkg/minikube/cruntime"
@@ -28,6 +29,7 @@ import (
 	"k8s.io/minikube/pkg/minikube/logs"
 	"k8s.io/minikube/pkg/minikube/mustload"
 	"k8s.io/minikube/pkg/minikube/out"
+	"k8s.io/minikube/pkg/minikube/reason"
 )
 
 const (
@@ -43,43 +45,64 @@ var (
 	numberOfLines int
 	// showProblems only shows lines that match known issues
 	showProblems bool
+	// fileOutput is where to write logs to. If omitted, writes to stdout.
+	fileOutput string
 )
 
 // logsCmd represents the logs command
 var logsCmd = &cobra.Command{
 	Use:   "logs",
-	Short: "Gets the logs of the running instance, used for debugging minikube, not user code.",
+	Short: "Returns logs to debug a local Kubernetes cluster",
 	Long:  `Gets the logs of the running instance, used for debugging minikube, not user code.`,
 	Run: func(cmd *cobra.Command, args []string) {
+		var logOutput *os.File = os.Stdout
+		var err error
+
+		if fileOutput != "" {
+			logOutput, err = os.Create(fileOutput)
+			defer func() {
+				err := logOutput.Close()
+				if err != nil {
+					klog.Warning("Failed to close file: %v", err)
+				}
+			}()
+			if err != nil {
+				exit.Error(reason.Usage, "Failed to create file", err)
+			}
+		}
+
+		logs.OutputOffline(numberOfLines, logOutput)
+
 		co := mustload.Running(ClusterFlagValue())
 
-		bs, err := cluster.Bootstrapper(co.API, viper.GetString(cmdcfg.Bootstrapper), *co.Config, *co.CP.Node)
+		bs, err := cluster.Bootstrapper(co.API, viper.GetString(cmdcfg.Bootstrapper), *co.Config, co.CP.Runner)
 		if err != nil {
-			exit.WithError("Error getting cluster bootstrapper", err)
+			exit.Error(reason.InternalBootstrapper, "Error getting cluster bootstrapper", err)
 		}
 
 		cr, err := cruntime.New(cruntime.Config{Type: co.Config.KubernetesConfig.ContainerRuntime, Runner: co.CP.Runner})
 		if err != nil {
-			exit.WithError("Unable to get runtime", err)
+			exit.Error(reason.InternalNewRuntime, "Unable to get runtime", err)
 		}
+
 		if followLogs {
-			err := logs.Follow(cr, bs, *co.Config, co.CP.Runner)
+			err := logs.Follow(cr, bs, *co.Config, co.CP.Runner, logOutput)
 			if err != nil {
-				exit.WithError("Follow", err)
+				exit.Error(reason.InternalLogFollow, "Follow", err)
 			}
 			return
 		}
 		if showProblems {
 			problems := logs.FindProblems(cr, bs, *co.Config, co.CP.Runner)
-			logs.OutputProblems(problems, numberOfProblems)
+			logs.OutputProblems(problems, numberOfProblems, logOutput)
 			return
 		}
-		err = logs.Output(cr, bs, *co.Config, co.CP.Runner, numberOfLines)
+		err = logs.Output(cr, bs, *co.Config, co.CP.Runner, numberOfLines, logOutput)
 		if err != nil {
 			out.Ln("")
-			// Avoid exit.WithError, since it outputs the issue URL
+			// Avoid exit.Error, since it outputs the issue URL
 			out.WarningT("{{.error}}", out.V{"error": err})
-			os.Exit(exit.Unavailable)
+			os.Exit(reason.ExSvcError)
 		}
 	},
 }
@@ -89,4 +112,5 @@ func init() {
 	logsCmd.Flags().BoolVar(&showProblems, "problems", false, "Show only log entries which point to known problems")
 	logsCmd.Flags().IntVarP(&numberOfLines, "length", "n", 60, "Number of lines back to go within the log")
 	logsCmd.Flags().StringVar(&nodeName, "node", "", "The node to get logs from. Defaults to the primary control plane.")
+	logsCmd.Flags().StringVar(&fileOutput, "file", "", "If present, writes to the provided file instead of stdout.")
 }

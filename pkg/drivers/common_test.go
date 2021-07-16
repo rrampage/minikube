@@ -27,7 +27,7 @@ import (
 
 func Test_createDiskImage(t *testing.T) {
 	tmpdir := tests.MakeTempDir()
-	defer os.RemoveAll(tmpdir)
+	defer tests.RemoveTempDir(tmpdir)
 
 	sshPath := filepath.Join(tmpdir, "ssh")
 	if err := ioutil.WriteFile(sshPath, []byte("mysshkey"), 0644); err != nil {
@@ -36,7 +36,7 @@ func Test_createDiskImage(t *testing.T) {
 	diskPath := filepath.Join(tmpdir, "disk")
 
 	sizeInMb := 100
-	sizeInBytes := int64(sizeInMb) * 1000000
+	sizeInBytes := int64(104857600)
 	if err := createRawDiskImage(sshPath, diskPath, sizeInMb); err != nil {
 		t.Errorf("createDiskImage() error = %v", err)
 	}

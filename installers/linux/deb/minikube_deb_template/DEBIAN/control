@@ -1,9 +1,9 @@
 Package: minikube
-Version: --VERSION--
+Version: --VERSION-----REVISION--
 Section: base
 Priority: optional
 Architecture: --ARCH--
-Recommends: virtualbox
+Recommends: --RECOMMENDS--
 Maintainer: Thomas Strömberg <t+minikube@stromberg.org>
 Description: Minikube
  minikube is a tool that makes it easy to run Kubernetes locally.

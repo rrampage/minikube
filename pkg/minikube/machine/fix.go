@@ -28,12 +28,14 @@ import (
 	"github.com/docker/machine/libmachine"
 	"github.com/docker/machine/libmachine/host"
 	"github.com/docker/machine/libmachine/state"
-	"github.com/golang/glog"
 	"github.com/pkg/errors"
+	"k8s.io/klog/v2"
 	"k8s.io/minikube/pkg/minikube/config"
 	"k8s.io/minikube/pkg/minikube/constants"
 	"k8s.io/minikube/pkg/minikube/driver"
 	"k8s.io/minikube/pkg/minikube/out"
+	"k8s.io/minikube/pkg/minikube/out/register"
+	"k8s.io/minikube/pkg/minikube/style"
 )
 
 // hostRunner is a minimal host.Host based interface for running commands
@@ -48,17 +50,18 @@ const (
 )
 
 // fixHost fixes up a previously configured VM so that it is ready to run Kubernetes
-func fixHost(api libmachine.API, cc config.ClusterConfig, n config.Node) (*host.Host, error) {
+func fixHost(api libmachine.API, cc *config.ClusterConfig, n *config.Node) (*host.Host, error) {
 	start := time.Now()
-	glog.Infof("fixHost starting: %s", n.Name)
+	klog.Infof("fixHost starting: %s", n.Name)
 	defer func() {
-		glog.Infof("fixHost completed within %s", time.Since(start))
+		klog.Infof("fixHost completed within %s", time.Since(start))
 	}()
 
-	h, err := api.Load(driver.MachineName(cc, n))
+	h, err := api.Load(config.MachineName(*cc, *n))
 	if err != nil {
 		return h, errors.Wrap(err, "Error loading existing host. Please try running [minikube delete], then run [minikube start] again.")
 	}
+	defer postStartValidations(h, cc.Driver)
 
 	driverName := h.Driver.DriverName()
 
@@ -72,7 +75,7 @@ func fixHost(api libmachine.API, cc config.ClusterConfig, n config.Node) (*host.
 
 	// Avoid reprovisioning "none" driver because provision.Detect requires SSH
 	if !driver.BareMetal(h.Driver.DriverName()) {
-		e := engineOptions(cc)
+		e := engineOptions(*cc)
 		h.HostOptions.EngineOptions.Env = e.Env
 		err = provisionDockerMachine(h)
 		if err != nil {
@@ -84,36 +87,37 @@ func fixHost(api libmachine.API, cc config.ClusterConfig, n config.Node) (*host.
 		return h, nil
 	}
 
-	if err := postStartSetup(h, cc); err != nil {
+	if err := postStartSetup(h, *cc); err != nil {
 		return h, errors.Wrap(err, "post-start")
 	}
 
 	if driver.BareMetal(h.Driver.DriverName()) {
-		glog.Infof("%s is local, skipping auth/time setup (requires ssh)", driverName)
+		klog.Infof("%s is local, skipping auth/time setup (requires ssh)", driverName)
 		return h, nil
 	}
 
 	return h, ensureSyncedGuestClock(h, driverName)
 }
 
-func recreateIfNeeded(api libmachine.API, cc config.ClusterConfig, n config.Node, h *host.Host) (*host.Host, error) {
-	machineName := driver.MachineName(cc, n)
+func recreateIfNeeded(api libmachine.API, cc *config.ClusterConfig, n *config.Node, h *host.Host) (*host.Host, error) {
+	machineName := config.MachineName(*cc, *n)
 	machineType := driver.MachineType(cc.Driver)
 	recreated := false
 	s, serr := h.Driver.GetState()
 
-	glog.Infof("recreateIfNeeded on %s: state=%s err=%v", machineName, s, serr)
+	klog.Infof("recreateIfNeeded on %s: state=%s err=%v", machineName, s, serr)
 	if serr != nil || s == state.Stopped || s == state.None {
 		// If virtual machine does not exist due to user interrupt cancel(i.e. Ctrl + C), recreate virtual machine
 		me, err := machineExists(h.Driver.DriverName(), s, serr)
-		glog.Infof("exists: %v err=%v", me, err)
-		glog.Infof("%q vs %q", err, constants.ErrMachineMissing)
+		if err != nil {
+			klog.Infof("machineExists: %t. err=%v", me, err)
+		}
 
 		if !me || err == constants.ErrMachineMissing {
-			out.T(out.Shrug, `{{.driver_name}} "{{.cluster}}" {{.machine_type}} is missing, will recreate.`, out.V{"driver_name": cc.Driver, "cluster": cc.Name, "machine_type": machineType})
-			demolish(api, cc, n, h)
+			out.Step(style.Shrug, `{{.driver_name}} "{{.cluster}}" {{.machine_type}} is missing, will recreate.`, out.V{"driver_name": cc.Driver, "cluster": machineName, "machine_type": machineType})
+			demolish(api, *cc, *n, h)
 
-			glog.Infof("Sleeping 1 second for extra luck!")
+			klog.Infof("Sleeping 1 second for extra luck!")
 			time.Sleep(1 * time.Second)
 
 			h, err = createHost(api, cc, n)
@@ -127,25 +131,28 @@ func recreateIfNeeded(api libmachine.API, cc config.ClusterConfig, n config.Node
 	}
 
 	if serr != constants.ErrMachineMissing {
-		glog.Warningf("unexpected machine state, will restart: %v", serr)
+		klog.Warningf("unexpected machine state, will restart: %v", serr)
 	}
 
 	if s == state.Running {
 		if !recreated {
-			out.T(out.Running, `Updating the running {{.driver_name}} "{{.cluster}}" {{.machine_type}} ...`, out.V{"driver_name": cc.Driver, "cluster": cc.Name, "machine_type": machineType})
+			register.Reg.SetStep(register.UpdatingDriver)
+			out.Step(style.Running, `Updating the running {{.driver_name}} "{{.cluster}}" {{.machine_type}} ...`, out.V{"driver_name": cc.Driver, "cluster": machineName, "machine_type": machineType})
 		}
 		return h, nil
 	}
 
 	if !recreated {
-		out.T(out.Restarting, `Restarting existing {{.driver_name}} {{.machine_type}} for "{{.cluster}}" ...`, out.V{"driver_name": cc.Driver, "cluster": cc.Name, "machine_type": machineType})
+		out.Step(style.Restarting, `Restarting existing {{.driver_name}} {{.machine_type}} for "{{.cluster}}" ...`, out.V{"driver_name": cc.Driver, "cluster": machineName, "machine_type": machineType})
 	}
 	if err := h.Driver.Start(); err != nil {
+		MaybeDisplayAdvice(err, h.DriverName)
 		return h, errors.Wrap(err, "driver start")
 	}
-	if err := api.Save(h); err != nil {
-		return h, errors.Wrap(err, "save")
+	if err := saveHost(api, h, cc, n); err != nil {
+		return h, err
 	}
+
 	return h, nil
 }
 
@@ -155,18 +162,24 @@ func maybeWarnAboutEvalEnv(drver string, name string) {
 	if !driver.IsKIC(drver) {
 		return
 	}
-	p := os.Getenv(constants.MinikubeActiveDockerdEnv)
-	if p == "" {
-		return
-	}
-	out.T(out.Notice, "Noticed you have an activated docker-env on {{.driver_name}} driver in this terminal:", out.V{"driver_name": drver})
-	// TODO: refactor docker-env package to generate only eval command per shell. https://github.com/kubernetes/minikube/issues/6887
-	out.WarningT(`Please re-eval your docker-env, To ensure your environment variables have updated ports: 
+	if os.Getenv(constants.MinikubeActiveDockerdEnv) != "" {
+		out.Styled(style.Notice, "Noticed you have an activated docker-env on {{.driver_name}} driver in this terminal:", out.V{"driver_name": drver})
+		// TODO: refactor docker-env package to generate only eval command per shell. https://github.com/kubernetes/minikube/issues/6887
+		out.WarningT(`Please re-eval your docker-env, To ensure your environment variables have updated ports:
 
 	'minikube -p {{.profile_name}} docker-env'
 
 	`, out.V{"profile_name": name})
+	}
+	if os.Getenv(constants.MinikubeActivePodmanEnv) != "" {
+		out.Styled(style.Notice, "Noticed you have an activated podman-env on {{.driver_name}} driver in this terminal:", out.V{"driver_name": drver})
+		// TODO: refactor podman-env package to generate only eval command per shell. https://github.com/kubernetes/minikube/issues/6887
+		out.WarningT(`Please re-eval your podman-env, To ensure your environment variables have updated ports:
 
+	'minikube -p {{.profile_name}} podman-env'
+
+	`, out.V{"profile_name": name})
+	}
 }
 
 // ensureGuestClockSync ensures that the guest system clock is relatively in-sync
@@ -176,11 +189,11 @@ func ensureSyncedGuestClock(h hostRunner, drv string) error {
 	}
 	d, err := guestClockDelta(h, time.Now())
 	if err != nil {
-		glog.Warningf("Unable to measure system clock delta: %v", err)
+		klog.Warningf("Unable to measure system clock delta: %v", err)
 		return nil
 	}
 	if math.Abs(d.Seconds()) < maxClockDesyncSeconds {
-		glog.Infof("guest clock delta is within tolerance: %s", d)
+		klog.Infof("guest clock delta is within tolerance: %s", d)
 		return nil
 	}
 	if err := adjustGuestClock(h, time.Now()); err != nil {
@@ -196,7 +209,7 @@ func guestClockDelta(h hostRunner, local time.Time) (time.Duration, error) {
 	if err != nil {
 		return 0, errors.Wrap(err, "get clock")
 	}
-	glog.Infof("guest clock: %s", out)
+	klog.Infof("guest clock: %s", out)
 	ns := strings.Split(strings.TrimSpace(out), ".")
 	secs, err := strconv.ParseInt(strings.TrimSpace(ns[0]), 10, 64)
 	if err != nil {
@@ -209,14 +222,14 @@ func guestClockDelta(h hostRunner, local time.Time) (time.Duration, error) {
 	// NOTE: In a synced state, remote is a few hundred ms ahead of local
 	remote := time.Unix(secs, nsecs)
 	d := remote.Sub(local)
-	glog.Infof("Guest: %s Remote: %s (delta=%s)", remote, local, d)
+	klog.Infof("Guest: %s Remote: %s (delta=%s)", remote, local, d)
 	return d, nil
 }
 
 // adjustSystemClock adjusts the guest system clock to be nearer to the host system clock
 func adjustGuestClock(h hostRunner, t time.Time) error {
 	out, err := h.RunSSHCommand(fmt.Sprintf("sudo date -s @%d", t.Unix()))
-	glog.Infof("clock set: %s (err=%v)", out, err)
+	klog.Infof("clock set: %s (err=%v)", out, err)
 	return err
 }
 

@@ -17,20 +17,20 @@ limitations under the License.
 package storageclass
 
 import (
+	"context"
 	"strconv"
 
 	"github.com/pkg/errors"
 	v1 "k8s.io/api/storage/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/kubernetes"
 	storagev1 "k8s.io/client-go/kubernetes/typed/storage/v1"
-	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/minikube/pkg/kapi"
 )
 
 func annotateDefaultStorageClass(storage storagev1.StorageV1Interface, class *v1.StorageClass, enable bool) error {
 	isDefault := strconv.FormatBool(enable)
 	metav1.SetMetaDataAnnotation(&class.ObjectMeta, "storageclass.kubernetes.io/is-default-class", isDefault)
-	_, err := storage.StorageClasses().Update(class)
+	_, err := storage.StorageClasses().Update(context.Background(), class, metav1.UpdateOptions{})
 
 	return err
 }
@@ -38,7 +38,7 @@ func annotateDefaultStorageClass(storage storagev1.StorageV1Interface, class *v1
 // DisableDefaultStorageClass disables the default storage class provisioner
 // The addon-manager and kubectl apply cannot delete storageclasses
 func DisableDefaultStorageClass(storage storagev1.StorageV1Interface, class string) error {
-	sc, err := storage.StorageClasses().Get(class, metav1.GetOptions{})
+	sc, err := storage.StorageClasses().Get(context.Background(), class, metav1.GetOptions{})
 	if err != nil {
 		return errors.Wrapf(err, "Error getting storage class %s", class)
 	}
@@ -53,7 +53,7 @@ func DisableDefaultStorageClass(storage storagev1.StorageV1Interface, class stri
 // SetDefaultStorageClass makes sure only the class with @name is marked as
 // default.
 func SetDefaultStorageClass(storage storagev1.StorageV1Interface, name string) error {
-	scList, err := storage.StorageClasses().List(metav1.ListOptions{})
+	scList, err := storage.StorageClasses().List(context.Background(), metav1.ListOptions{})
 	if err != nil {
 		return errors.Wrap(err, "Error listing StorageClasses")
 	}
@@ -71,25 +71,11 @@ func SetDefaultStorageClass(storage storagev1.StorageV1Interface, name string) e
 }
 
 // GetStoragev1 return storage v1 interface for client
-func GetStoragev1() (storagev1.StorageV1Interface, error) {
-	client, err := getClient()
+func GetStoragev1(context string) (storagev1.StorageV1Interface, error) {
+	client, err := kapi.Client(context)
 	if err != nil {
 		return nil, err
 	}
 	sv1 := client.StorageV1()
 	return sv1, nil
-}
-
-func getClient() (*kubernetes.Clientset, error) {
-	loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
-	kubeConfig := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(loadingRules, &clientcmd.ConfigOverrides{})
-	config, err := kubeConfig.ClientConfig()
-	if err != nil {
-		return nil, errors.Wrap(err, "Error creating kubeConfig")
-	}
-	client, err := kubernetes.NewForConfig(config)
-	if err != nil {
-		return nil, errors.Wrap(err, "Error creating new client from kubeConfig.ClientConfig()")
-	}
-	return client, nil
 }

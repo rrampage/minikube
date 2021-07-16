@@ -20,12 +20,16 @@ import (
 	"os"
 
 	"github.com/spf13/cobra"
-	"github.com/spf13/cobra/doc"
+	"k8s.io/minikube/pkg/generate"
 	"k8s.io/minikube/pkg/minikube/exit"
 	"k8s.io/minikube/pkg/minikube/out"
+	"k8s.io/minikube/pkg/minikube/reason"
+	"k8s.io/minikube/pkg/minikube/style"
 )
 
-var path string
+var docsPath string
+var testPath string
+var codePath string
 
 // generateDocs represents the generate-docs command
 var generateDocs = &cobra.Command{
@@ -35,22 +39,25 @@ var generateDocs = &cobra.Command{
 	Example: "minikube generate-docs --path <FOLDER_PATH>",
 	Hidden:  true,
 	Run: func(cmd *cobra.Command, args []string) {
-
 		// if directory does not exist
-		docsPath, err := os.Stat(path)
-		if err != nil || !docsPath.IsDir() {
-			exit.UsageT("Unable to generate the documentation. Please ensure that the path specified is a directory, exists & you have permission to write to it.")
+		st, err := os.Stat(docsPath)
+		if err != nil || !st.IsDir() {
+			exit.Message(reason.Usage, "Unable to generate the documentation. Please ensure that the path specified is a directory, exists & you have permission to write to it.")
 		}
 
 		// generate docs
-		if err := doc.GenMarkdownTree(RootCmd, path); err != nil {
-			exit.WithError("Unable to generate docs", err)
+		if err := generate.Docs(RootCmd, docsPath, testPath, codePath); err != nil {
+			exit.Error(reason.InternalGenerateDocs, "Unable to generate docs", err)
 		}
-		out.T(out.Documentation, "Docs have been saved at - {{.path}}", out.V{"path": path})
+		out.Step(style.Documentation, "Docs have been saved at - {{.path}}", out.V{"path": docsPath})
+		out.Step(style.Documentation, "Test docs have been saved at - {{.path}}", out.V{"path": testPath})
+		out.Step(style.Documentation, "Error code docs have been saved at - {{.path}}", out.V{"path": codePath})
 	},
 }
 
 func init() {
-	generateDocs.Flags().StringVar(&path, "path", "", "The path on the file system where the docs in markdown need to be saved")
+	generateDocs.Flags().StringVar(&docsPath, "path", "", "The path on the file system where the docs in markdown need to be saved")
+	generateDocs.Flags().StringVar(&testPath, "test-path", "", "The path on the file system where the testing docs in markdown need to be saved")
+	generateDocs.Flags().StringVar(&codePath, "code-path", "", "The path on the file system where the error code docs in markdown need to be saved")
 	RootCmd.AddCommand(generateDocs)
 }

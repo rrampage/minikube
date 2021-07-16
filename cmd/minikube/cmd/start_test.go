@@ -18,12 +18,17 @@ package cmd
 
 import (
 	"os"
+	"strings"
 	"testing"
 
+	"github.com/blang/semver/v4"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
+
 	cfg "k8s.io/minikube/pkg/minikube/config"
 	"k8s.io/minikube/pkg/minikube/constants"
+	"k8s.io/minikube/pkg/minikube/driver"
+	"k8s.io/minikube/pkg/minikube/proxy"
 )
 
 func TestGetKubernetesVersion(t *testing.T) {
@@ -80,10 +85,14 @@ func TestGetKubernetesVersion(t *testing.T) {
 	}
 }
 
+var checkRepoMock = func(v semver.Version, repo string) error {
+	return nil
+}
+
 func TestMirrorCountry(t *testing.T) {
 	// Set default disk size value in lieu of flag init
 	viper.SetDefault(humanReadableDiskSize, defaultDiskSize)
-
+	checkRepository = checkRepoMock
 	k8sVersion := constants.DefaultKubernetesVersion
 	var tests = []struct {
 		description     string
@@ -93,18 +102,33 @@ func TestMirrorCountry(t *testing.T) {
 		cfg             *cfg.ClusterConfig
 	}{
 		{
-			description:     "image-repository none, image-mirror-country none",
+			description:     "repository-none_mirror-none",
 			imageRepository: "",
 			mirrorCountry:   "",
 		},
 		{
-			description:     "image-repository auto, image-mirror-country none",
+			description:     "repository-none_mirror-cn",
+			imageRepository: "",
+			mirrorCountry:   "cn",
+		},
+		{
+			description:     "repository-auto_mirror-none",
 			imageRepository: "auto",
 			mirrorCountry:   "",
 		},
 		{
-			description:     "image-repository auto, image-mirror-country china",
+			description:     "repository-auto_mirror-cn",
 			imageRepository: "auto",
+			mirrorCountry:   "cn",
+		},
+		{
+			description:     "repository-registry.test.com_mirror-none",
+			imageRepository: "registry.test.com",
+			mirrorCountry:   "",
+		},
+		{
+			description:     "repository-registry.test.com_mirror-cn",
+			imageRepository: "registry.test.com",
 			mirrorCountry:   "cn",
 		},
 	}
@@ -114,7 +138,8 @@ func TestMirrorCountry(t *testing.T) {
 			cmd := &cobra.Command{}
 			viper.SetDefault(imageRepository, test.imageRepository)
 			viper.SetDefault(imageMirrorCountry, test.mirrorCountry)
-			config, _, err := generateCfgFromFlags(cmd, k8sVersion, "none")
+			viper.SetDefault(kvmNUMACount, 1)
+			config, _, err := generateClusterConfig(cmd, nil, k8sVersion, driver.Mock)
 			if err != nil {
 				t.Fatalf("Got unexpected error %v during config generation", err)
 			}
@@ -153,6 +178,20 @@ func TestGenerateCfgFromFlagsHTTPProxyHandling(t *testing.T) {
 			proxyIgnored: true,
 		},
 		{
+			description:  "http_proxy=http://localhost:3128",
+			proxy:        "http://localhost:3128",
+			proxyIgnored: true,
+		},
+		{
+			description:  "http_proxy=http://127.0.0.1:3128",
+			proxy:        "http://127.0.0.1:3128",
+			proxyIgnored: true,
+		},
+		{
+			description: "http_proxy=http://1.2.127.0:3128",
+			proxy:       "http://1.2.127.0:3128",
+		},
+		{
 			description: "http_proxy=1.2.3.4:3128",
 			proxy:       "1.2.3.4:3128",
 		},
@@ -166,14 +205,42 @@ func TestGenerateCfgFromFlagsHTTPProxyHandling(t *testing.T) {
 			if err := os.Setenv("HTTP_PROXY", test.proxy); err != nil {
 				t.Fatalf("Unexpected error setting HTTP_PROXY: %v", err)
 			}
-			config, _, err := generateCfgFromFlags(cmd, k8sVersion, "none")
+
+			cfg.DockerEnv = []string{} // clear docker env to avoid pollution
+			proxy.SetDockerEnv()
+			config, _, err := generateClusterConfig(cmd, nil, k8sVersion, "none")
 			if err != nil {
 				t.Fatalf("Got unexpected error %v during config generation", err)
 			}
-			// ignored proxy should not be in config
-			for _, v := range config.DockerEnv {
-				if v == test.proxy && test.proxyIgnored {
-					t.Fatalf("Value %v not expected in dockerEnv but occurred", v)
+			envPrefix := "HTTP_PROXY="
+			proxyEnv := envPrefix + test.proxy
+			if test.proxy == "" {
+				// If test.proxy is not set, ensure HTTP_PROXY is empty
+				for _, v := range config.DockerEnv {
+					if strings.HasPrefix(v, envPrefix) && len(v) > len(envPrefix) {
+						t.Fatalf("HTTP_PROXY should be empty but got %s", v)
+					}
+				}
+			} else {
+				if test.proxyIgnored {
+					// ignored proxy should not in config
+					for _, v := range config.DockerEnv {
+						if v == proxyEnv {
+							t.Fatalf("Value %v not expected in dockerEnv but occurred", test.proxy)
+						}
+					}
+				} else {
+					// proxy must in config
+					found := false
+					for _, v := range config.DockerEnv {
+						if v == proxyEnv {
+							found = true
+							break
+						}
+					}
+					if !found {
+						t.Fatalf("Value %s expected in dockerEnv but not occurred", test.proxy)
+					}
 				}
 			}
 		})
@@ -185,28 +252,114 @@ func TestSuggestMemoryAllocation(t *testing.T) {
 		description    string
 		sysLimit       int
 		containerLimit int
+		nodes          int
 		want           int
 	}{
-		{"128GB sys", 128000, 0, 6000},
-		{"64GB sys", 64000, 0, 6000},
-		{"16GB sys", 16384, 0, 4000},
-		{"odd sys", 14567, 0, 3600},
-		{"4GB sys", 4096, 0, 2200},
-		{"2GB sys", 2048, 0, 2048},
-		{"Unable to poll sys", 0, 0, 2200},
-		{"128GB sys, 16GB container", 128000, 16384, 16336},
-		{"64GB sys, 16GB container", 64000, 16384, 16000},
-		{"16GB sys, 4GB container", 16384, 4096, 4000},
-		{"4GB sys, 3.5GB container", 16384, 3500, 3452},
-		{"2GB sys, 2GB container", 16384, 2048, 2048},
-		{"2GB sys, unable to poll container", 16384, 0, 4000},
+		{"128GB sys", 128000, 0, 1, 6000},
+		{"64GB sys", 64000, 0, 1, 6000},
+		{"32GB sys", 32768, 0, 1, 6000},
+		{"16GB sys", 16384, 0, 1, 4000},
+		{"odd sys", 14567, 0, 1, 3600},
+		{"4GB sys", 4096, 0, 1, 2200},
+		{"2GB sys", 2048, 0, 1, 2048},
+		{"Unable to poll sys", 0, 0, 1, 2200},
+		{"128GB sys, 16GB container", 128000, 16384, 1, 16336},
+		{"64GB sys, 16GB container", 64000, 16384, 1, 16000},
+		{"16GB sys, 4GB container", 16384, 4096, 1, 4000},
+		{"4GB sys, 3.5GB container", 16384, 3500, 1, 3452},
+		{"16GB sys, 2GB container", 16384, 2048, 1, 2048},
+		{"16GB sys, unable to poll container", 16384, 0, 1, 4000},
+		{"128GB sys 2 nodes", 128000, 0, 2, 6000},
+		{"8GB sys 3 nodes", 8192, 0, 3, 2200},
+		{"16GB sys 2 nodes", 16384, 0, 2, 2200},
+		{"32GB sys 2 nodes", 32768, 0, 2, 4050},
+		{"odd sys 2 nodes", 14567, 0, 2, 2200},
+		{"4GB sys 2 nodes", 4096, 0, 2, 2200},
+		{"2GB sys 3 nodes", 2048, 0, 3, 2048},
 	}
 	for _, test := range tests {
 		t.Run(test.description, func(t *testing.T) {
-			got := suggestMemoryAllocation(test.sysLimit, test.containerLimit)
+			got := suggestMemoryAllocation(test.sysLimit, test.containerLimit, test.nodes)
 			if got != test.want {
 				t.Errorf("defaultMemorySize(sys=%d, container=%d) = %d, want: %d", test.sysLimit, test.containerLimit, got, test.want)
 			}
 		})
 	}
+}
+
+func TestBaseImageFlagDriverCombo(t *testing.T) {
+	tests := []struct {
+		driver        string
+		canUseBaseImg bool
+	}{
+		{driver.Docker, true},
+		{driver.Podman, true},
+		{driver.None, false},
+		{driver.KVM2, false},
+		{driver.VirtualBox, false},
+		{driver.HyperKit, false},
+		{driver.VMware, false},
+		{driver.VMwareFusion, false},
+		{driver.HyperV, false},
+		{driver.Parallels, false},
+		{"something_invalid", false},
+		{"", false},
+	}
+
+	for _, test := range tests {
+		t.Run(test.driver, func(t *testing.T) {
+			got := isBaseImageApplicable(test.driver)
+			if got != test.canUseBaseImg {
+				t.Errorf("isBaseImageApplicable(driver=%v): got %v, expected %v",
+					test.driver, got, test.canUseBaseImg)
+			}
+		})
+	}
+}
+
+func TestValidateImageRepository(t *testing.T) {
+	var tests = []struct {
+		imageRepository      string
+		validImageRepository string
+	}{
+		{
+			imageRepository:      "auto",
+			validImageRepository: "auto",
+		},
+		{
+			imageRepository:      "http://registry.test.com/google_containers/",
+			validImageRepository: "registry.test.com/google_containers",
+		},
+		{
+			imageRepository:      "https://registry.test.com/google_containers/",
+			validImageRepository: "registry.test.com/google_containers",
+		},
+		{
+			imageRepository:      "registry.test.com/google_containers/",
+			validImageRepository: "registry.test.com/google_containers",
+		},
+		{
+			imageRepository:      "http://registry.test.com/google_containers",
+			validImageRepository: "registry.test.com/google_containers",
+		},
+		{
+			imageRepository:      "https://registry.test.com/google_containers",
+			validImageRepository: "registry.test.com/google_containers",
+		},
+		{
+			imageRepository:      "https://registry.test.com:6666/google_containers",
+			validImageRepository: "registry.test.com:6666/google_containers",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.imageRepository, func(t *testing.T) {
+			validImageRepository := validateImageRepository(test.imageRepository)
+			if validImageRepository != test.validImageRepository {
+				t.Errorf("validateImageRepository(imageRepo=%v): got %v, expected %v",
+					test.imageRepository, validImageRepository, test.validImageRepository)
+			}
+		})
+	}
+
 }

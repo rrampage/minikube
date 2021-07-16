@@ -26,6 +26,7 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/pkg/errors"
+	"k8s.io/klog/v2"
 	"k8s.io/minikube/pkg/minikube/assets"
 	"k8s.io/minikube/pkg/minikube/command"
 )
@@ -62,14 +63,19 @@ func TestImageExists(t *testing.T) {
 		sha     string
 		want    bool
 	}{
-		{"docker", "missing", "0000000000000000000000000000000000000000000000000000000000000000", false},
-		{"docker", "image", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", true},
-		{"crio", "missing", "0000000000000000000000000000000000000000000000000000000000000000", false},
-		{"crio", "image", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", true},
+		{"docker", "missing-image", "0000000000000000000000000000000000000000000000000000000000000000", false},
+		{"docker", "available-image", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", true},
+		{"crio", "missing-image", "0000000000000000000000000000000000000000000000000000000000000000", false},
+		{"crio", "available-image", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", true},
 	}
 	for _, tc := range tests {
+		runner := NewFakeRunner(t)
+		runner.images = map[string]string{
+			"available-image": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+		}
 		t.Run(tc.runtime, func(t *testing.T) {
-			r, err := New(Config{Type: tc.runtime, Runner: NewFakeRunner(t)})
+
+			r, err := New(Config{Type: tc.runtime, Runner: runner})
 			if err != nil {
 				t.Fatalf("New(%s): %v", tc.runtime, err)
 			}
@@ -156,6 +162,7 @@ type FakeRunner struct {
 	cmds       []string
 	services   map[string]serviceState
 	containers map[string]string
+	images     map[string]string
 	t          *testing.T
 }
 
@@ -166,6 +173,7 @@ func NewFakeRunner(t *testing.T) *FakeRunner {
 		cmds:       []string{},
 		t:          t,
 		containers: map[string]string{},
+		images:     map[string]string{},
 	}
 }
 
@@ -214,6 +222,14 @@ func (f *FakeRunner) RunCmd(cmd *exec.Cmd) (*command.RunResult, error) {
 		rr := &command.RunResult{}
 		return rr, nil
 	}
+}
+
+func (f *FakeRunner) StartCmd(cmd *exec.Cmd) (*command.StartedCmd, error) {
+	return &command.StartedCmd{}, nil
+}
+
+func (f *FakeRunner) WaitCmd(sc *command.StartedCmd) (*command.RunResult, error) {
+	return &command.RunResult{}, nil
 }
 
 func (f *FakeRunner) Copy(assets.CopyableFile) error {
@@ -266,6 +282,29 @@ func (f *FakeRunner) dockerRm(args []string) (string, error) {
 	return "", nil
 }
 
+func (f *FakeRunner) dockerInspect(args []string) (string, error) {
+	if args[1] == "--format" && args[2] == "{{.Id}}" {
+		image, ok := f.images[args[3]]
+		if !ok {
+			return "", &exec.ExitError{Stderr: []byte("Error: No such object: missing")}
+		}
+		return "sha256:" + image, nil
+	}
+	return "", nil
+}
+
+func (f *FakeRunner) dockerRmi(args []string) (string, error) {
+	// Skip "-f" argument
+	for _, id := range args[1:] {
+		f.t.Logf("fake docker: Removing id %q", id)
+		if f.images[id] == "" {
+			return "", fmt.Errorf("no such image")
+		}
+		delete(f.images, id)
+	}
+	return "", nil
+}
+
 // docker is a fake implementation of docker
 func (f *FakeRunner) docker(args []string, _ bool) (string, error) {
 	switch cmd := args[0]; cmd {
@@ -284,14 +323,16 @@ func (f *FakeRunner) docker(args []string, _ bool) (string, error) {
 			return "18.06.2-ce", nil
 		}
 
-	case "inspect":
-
-		if args[1] == "--format" && args[2] == "{{.Id}}" {
-			if args[3] == "missing" {
-				return "", &exec.ExitError{Stderr: []byte("Error: No such object: missing")}
-			}
-			return "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", nil
+	case "image":
+		if args[1] == "inspect" {
+			return f.dockerInspect(args[1:])
 		}
+
+	case "rmi":
+		return f.dockerRmi(args)
+
+	case "inspect":
+		return f.dockerInspect(args)
 
 	case "info":
 
@@ -308,9 +349,9 @@ func (f *FakeRunner) podman(args []string, _ bool) (string, error) {
 	case "--version":
 		return "podman version 1.6.4", nil
 
-	case "inspect":
+	case "image":
 
-		if args[1] == "--format" && args[2] == "{{.Id}}" {
+		if args[1] == "inspect" && args[2] == "--format" && args[3] == "{{.Id}}" {
 			if args[3] == "missing" {
 				return "", &exec.ExitError{Stderr: []byte("Error: error getting image \"missing\": unable to find a name and tag match for missing in repotags: no such image")}
 			}
@@ -399,19 +440,41 @@ func (f *FakeRunner) crictl(args []string, _ bool) (string, error) {
 			delete(f.containers, id)
 
 		}
-
+	case "rmi":
+		for _, id := range args[1:] {
+			f.t.Logf("fake crictl: Removing id %q", id)
+			if f.images[id] == "" {
+				return "", fmt.Errorf("no such image")
+			}
+			delete(f.images, id)
+		}
 	}
 	return "", nil
 }
 
 // systemctl is a fake implementation of systemctl
 func (f *FakeRunner) systemctl(args []string, root bool) (string, error) { // nolint result 0 (string) is always ""
+	klog.Infof("fake systemctl: %v", args)
 	action := args[0]
-	svcs := args[1:]
+
+	if action == "--version" {
+		return "systemd 123 (321.2-1)", nil
+	}
+
+	if action == "daemon-reload" {
+		return "ok", nil
+	}
+
+	var svcs []string
+	if len(args) > 0 {
+		svcs = args[1:]
+	}
+
 	// force
 	if svcs[0] == "-f" {
 		svcs = svcs[1:]
 	}
+
 	out := ""
 
 	for i, arg := range args {
@@ -423,6 +486,7 @@ func (f *FakeRunner) systemctl(args []string, root bool) (string, error) { // no
 	}
 
 	for _, svc := range svcs {
+		svc = strings.Replace(svc, ".service", "", 1)
 		state, ok := f.services[svc]
 		if !ok {
 			return out, fmt.Errorf("unknown fake service: %s", svc)
@@ -453,6 +517,21 @@ func (f *FakeRunner) systemctl(args []string, root bool) (string, error) { // no
 				return out, nil
 			}
 			return out, fmt.Errorf("%s in state: %v", svc, state)
+		case "cat":
+			f.t.Logf("fake systemctl: %s cat: %v", svc, state)
+			if svc == "docker.service" {
+				out += "[Unit]\n"
+				out += "Description=Docker Application Container Engine\n"
+				out += "Documentation=https://docs.docker.com\n"
+				// out += "BindsTo=containerd.service\n"
+				return out, nil
+			}
+			return out, fmt.Errorf("%s cat unimplemented", svc)
+		case "enable":
+		case "disable":
+		case "mask":
+		case "unmask":
+			f.t.Logf("fake systemctl: %s %s: %v", svc, action, state)
 		default:
 			return out, fmt.Errorf("unimplemented fake action: %q", action)
 		}
@@ -496,10 +575,17 @@ func TestVersion(t *testing.T) {
 // defaultServices reflects the default boot state for the minikube VM
 var defaultServices = map[string]serviceState{
 	"docker":        SvcRunning,
-	"docker.socket": SvcRunning,
 	"crio":          SvcExited,
 	"crio-shutdown": SvcExited,
 	"containerd":    SvcExited,
+}
+
+// allServices reflects the state of all actual services running at once
+var allServices = map[string]serviceState{
+	"docker":        SvcRunning,
+	"crio":          SvcRunning,
+	"crio-shutdown": SvcExited,
+	"containerd":    SvcRunning,
 }
 
 func TestDisable(t *testing.T) {
@@ -507,7 +593,8 @@ func TestDisable(t *testing.T) {
 		runtime string
 		want    []string
 	}{
-		{"docker", []string{"sudo", "systemctl", "stop", "-f", "docker", "docker.socket"}},
+		{"docker", []string{"sudo", "systemctl", "stop", "-f", "docker.socket", "sudo", "systemctl", "stop", "-f", "docker.service",
+			"sudo", "systemctl", "disable", "docker.socket", "sudo", "systemctl", "mask", "docker.service"}},
 		{"crio", []string{"sudo", "systemctl", "stop", "-f", "crio"}},
 		{"containerd", []string{"sudo", "systemctl", "stop", "-f", "containerd"}},
 	}
@@ -534,42 +621,50 @@ func TestDisable(t *testing.T) {
 
 func TestEnable(t *testing.T) {
 	var tests = []struct {
-		runtime string
-		want    map[string]serviceState
+		runtime  string
+		services map[string]serviceState
+		want     map[string]serviceState
 	}{
-		{"docker", map[string]serviceState{
-			"docker":        SvcRunning,
-			"docker.socket": SvcRunning,
-			"containerd":    SvcExited,
-			"crio":          SvcExited,
-			"crio-shutdown": SvcExited,
-		}},
-		{"containerd", map[string]serviceState{
-			"docker":        SvcExited,
-			"docker.socket": SvcExited,
-			"containerd":    SvcRestarted,
-			"crio":          SvcExited,
-			"crio-shutdown": SvcExited,
-		}},
-		{"crio", map[string]serviceState{
-			"docker":        SvcExited,
-			"docker.socket": SvcExited,
-			"containerd":    SvcExited,
-			"crio":          SvcRestarted,
-			"crio-shutdown": SvcExited,
-		}},
+		{"docker", defaultServices,
+			map[string]serviceState{
+				"docker":        SvcRunning,
+				"containerd":    SvcExited,
+				"crio":          SvcExited,
+				"crio-shutdown": SvcExited,
+			}},
+		{"docker", allServices,
+			map[string]serviceState{
+				"docker":        SvcRestarted,
+				"containerd":    SvcExited,
+				"crio":          SvcExited,
+				"crio-shutdown": SvcExited,
+			}},
+		{"containerd", defaultServices,
+			map[string]serviceState{
+				"docker":        SvcExited,
+				"containerd":    SvcRestarted,
+				"crio":          SvcExited,
+				"crio-shutdown": SvcExited,
+			}},
+		{"crio", defaultServices,
+			map[string]serviceState{
+				"docker":        SvcExited,
+				"containerd":    SvcExited,
+				"crio":          SvcRunning,
+				"crio-shutdown": SvcExited,
+			}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.runtime, func(t *testing.T) {
 			runner := NewFakeRunner(t)
-			for k, v := range defaultServices {
+			for k, v := range tc.services {
 				runner.services[k] = v
 			}
 			cr, err := New(Config{Type: tc.runtime, Runner: runner})
 			if err != nil {
 				t.Fatalf("New(%s): %v", tc.runtime, err)
 			}
-			err = cr.Enable(true)
+			err = cr.Enable(true, false)
 			if err != nil {
 				t.Errorf("%s disable unexpected error: %v", tc.runtime, err)
 			}
@@ -602,13 +697,16 @@ func TestContainerFunctions(t *testing.T) {
 				"fgh1": prefix + "coredns",
 				"xyz2": prefix + "storage",
 			}
+			runner.images = map[string]string{
+				"image1": "latest",
+			}
 			cr, err := New(Config{Type: tc.runtime, Runner: runner})
 			if err != nil {
 				t.Fatalf("New(%s): %v", tc.runtime, err)
 			}
 
 			// Get the list of apiservers
-			got, err := cr.ListContainers(ListOptions{Name: "apiserver"})
+			got, err := cr.ListContainers(ListContainersOptions{Name: "apiserver"})
 			if err != nil {
 				t.Fatalf("ListContainers: %v", err)
 			}
@@ -621,7 +719,7 @@ func TestContainerFunctions(t *testing.T) {
 			if err := cr.StopContainers(got); err != nil {
 				t.Fatalf("stop failed: %v", err)
 			}
-			got, err = cr.ListContainers(ListOptions{Name: "apiserver"})
+			got, err = cr.ListContainers(ListContainersOptions{Name: "apiserver"})
 			if err != nil {
 				t.Fatalf("ListContainers: %v", err)
 			}
@@ -631,7 +729,7 @@ func TestContainerFunctions(t *testing.T) {
 			}
 
 			// Get the list of everything else.
-			got, err = cr.ListContainers(ListOptions{})
+			got, err = cr.ListContainers(ListContainersOptions{})
 			if err != nil {
 				t.Fatalf("ListContainers: %v", err)
 			}
@@ -644,12 +742,20 @@ func TestContainerFunctions(t *testing.T) {
 			if err := cr.KillContainers(got); err != nil {
 				t.Errorf("KillContainers: %v", err)
 			}
-			got, err = cr.ListContainers(ListOptions{})
+			got, err = cr.ListContainers(ListContainersOptions{})
 			if err != nil {
 				t.Fatalf("ListContainers: %v", err)
 			}
 			if len(got) > 0 {
 				t.Errorf("ListContainers(apiserver) = %v, want 0 items", got)
+			}
+
+			// Remove a image
+			if err := cr.RemoveImage("image1"); err != nil {
+				t.Fatalf("RemoveImage: %v", err)
+			}
+			if len(runner.images) > 0 {
+				t.Errorf("RemoveImage = %v, want 0 items", len(runner.images))
 			}
 		})
 	}

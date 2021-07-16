@@ -36,31 +36,35 @@ import (
 	"github.com/docker/machine/libmachine/host"
 	"github.com/docker/machine/libmachine/mcnutils"
 	"github.com/docker/machine/libmachine/persist"
-	"github.com/docker/machine/libmachine/ssh"
+	lmssh "github.com/docker/machine/libmachine/ssh"
 	"github.com/docker/machine/libmachine/state"
 	"github.com/docker/machine/libmachine/swarm"
 	"github.com/docker/machine/libmachine/version"
-	"github.com/golang/glog"
+	"github.com/juju/fslock"
 	"github.com/pkg/errors"
+	"k8s.io/klog/v2"
 	"k8s.io/minikube/pkg/minikube/command"
 	"k8s.io/minikube/pkg/minikube/driver"
 	"k8s.io/minikube/pkg/minikube/exit"
 	"k8s.io/minikube/pkg/minikube/localpath"
 	"k8s.io/minikube/pkg/minikube/out"
+	"k8s.io/minikube/pkg/minikube/reason"
 	"k8s.io/minikube/pkg/minikube/registry"
-	"k8s.io/minikube/pkg/minikube/sshutil"
 )
 
 // NewRPCClient gets a new client.
 func NewRPCClient(storePath, certsDir string) libmachine.API {
 	c := libmachine.NewClient(storePath, certsDir)
-	c.SSHClientType = ssh.Native
+	c.SSHClientType = lmssh.Native
 	return c
 }
 
 // NewAPIClient gets a new client.
-func NewAPIClient() (libmachine.API, error) {
+func NewAPIClient(miniHome ...string) (libmachine.API, error) {
 	storePath := localpath.MiniPath()
+	if len(miniHome) > 0 {
+		storePath = miniHome[0]
+	}
 	certsDir := localpath.MakeMiniPath("certs")
 
 	return &LocalClient{
@@ -68,6 +72,7 @@ func NewAPIClient() (libmachine.API, error) {
 		storePath:    storePath,
 		Filestore:    persist.NewFilestore(storePath, certsDir, certsDir),
 		legacyClient: NewRPCClient(storePath, certsDir),
+		flock:        fslock.New(localpath.MakeMiniPath("machine_client.lock")),
 	}, nil
 }
 
@@ -78,6 +83,7 @@ type LocalClient struct {
 	storePath string
 	*persist.Filestore
 	legacyClient libmachine.API
+	flock        *fslock.Lock
 }
 
 // NewHost creates a new Host
@@ -151,25 +157,18 @@ func CommandRunner(h *host.Host) (command.Runner, error) {
 		return &command.FakeCommandRunner{}, nil
 	}
 	if driver.BareMetal(h.Driver.DriverName()) {
-		return command.NewExecRunner(), nil
+		return command.NewExecRunner(true), nil
 	}
 
-	if driver.IsKIC(h.Driver.DriverName()) {
-		return command.NewKICRunner(h.Name, h.Driver.DriverName()), nil
-	}
-	client, err := sshutil.NewSSHClient(h.Driver)
-	if err != nil {
-		return nil, errors.Wrap(err, "getting ssh client for bootstrapper")
-	}
-	return command.NewSSHRunner(client), nil
+	return command.NewSSHRunner(h.Driver), nil
 }
 
 // Create creates the host
 func (api *LocalClient) Create(h *host.Host) error {
-	glog.Infof("LocalClient.Create starting")
+	klog.Infof("LocalClient.Create starting")
 	start := time.Now()
 	defer func() {
-		glog.Infof("LocalClient.Create took %s", time.Since(start))
+		klog.Infof("LocalClient.Create took %s", time.Since(start))
 	}()
 
 	def := registry.Driver(h.DriverName)
@@ -187,7 +186,22 @@ func (api *LocalClient) Create(h *host.Host) error {
 	}{
 		{
 			"bootstrapping certificates",
-			func() error { return cert.BootstrapCertificates(h.AuthOptions()) },
+			func() error {
+				// Lock is needed to avoid race conditiion in parallel Docker-Env test because issue #10107.
+				// CA cert and client cert should be generated atomically, otherwise might cause bad certificate error.
+				lockErr := api.flock.LockWithTimeout(time.Second * 5)
+				if lockErr != nil {
+					return fmt.Errorf("failed to acquire bootstrap client lock: %v " + lockErr.Error())
+				}
+				defer func() {
+					lockErr = api.flock.Unlock()
+					if lockErr != nil {
+						klog.Errorf("falied to release bootstrap cert client lock: %v", lockErr.Error())
+					}
+				}()
+				certErr := cert.BootstrapCertificates(h.AuthOptions())
+				return certErr
+			},
 		},
 		{
 			"precreate",
@@ -225,7 +239,6 @@ func (api *LocalClient) Create(h *host.Host) error {
 	}
 
 	for _, step := range steps {
-
 		if err := step.f(); err != nil {
 			return errors.Wrap(err, step.name)
 		}
@@ -286,7 +299,7 @@ func (cg *CertGenerator) ValidateCertificate(addr string, authOptions *auth.Opti
 func registerDriver(drvName string) {
 	def := registry.Driver(drvName)
 	if def.Empty() {
-		exit.UsageT("unsupported or missing driver: {{.name}}", out.V{"name": drvName})
+		exit.Message(reason.Usage, "unsupported or missing driver: {{.name}}", out.V{"name": drvName})
 	}
 	plugin.RegisterDriver(def.Init())
 }

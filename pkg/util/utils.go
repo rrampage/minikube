@@ -23,13 +23,13 @@ import (
 	"path/filepath"
 	"strconv"
 
-	"github.com/blang/semver"
-	"github.com/docker/go-units"
+	"github.com/blang/semver/v4"
+	units "github.com/docker/go-units"
 	"github.com/pkg/errors"
 )
 
 const (
-	downloadURL = "https://storage.googleapis.com/minikube/releases/%s/minikube-%s-amd64%s"
+	downloadURL = "https://storage.googleapis.com/minikube/releases/%s/minikube-%s-%s%s"
 )
 
 // CalculateSizeInMB returns the number of MB in the human readable string
@@ -47,13 +47,28 @@ func CalculateSizeInMB(humanReadableSize string) (int, error) {
 	return int(size / units.MiB), nil
 }
 
-// GetBinaryDownloadURL returns a suitable URL for the platform
-func GetBinaryDownloadURL(version, platform string) string {
+// ConvertMBToBytes converts MB to bytes
+func ConvertMBToBytes(mbSize int) int64 {
+	return int64(mbSize) * units.MiB
+}
+
+// ConvertBytesToMB converts bytes to MB
+func ConvertBytesToMB(byteSize int64) int {
+	return int(ConvertUnsignedBytesToMB(uint64(byteSize)))
+}
+
+// ConvertUnsignedBytesToMB converts bytes to MB
+func ConvertUnsignedBytesToMB(byteSize uint64) int64 {
+	return int64(byteSize / units.MiB)
+}
+
+// GetBinaryDownloadURL returns a suitable URL for the platform and arch
+func GetBinaryDownloadURL(version, platform, arch string) string {
 	switch platform {
 	case "windows":
-		return fmt.Sprintf(downloadURL, version, platform, ".exe")
+		return fmt.Sprintf(downloadURL, version, platform, arch, ".exe")
 	default:
-		return fmt.Sprintf(downloadURL, version, platform, "")
+		return fmt.Sprintf(downloadURL, version, platform, arch, "")
 	}
 }
 
@@ -90,7 +105,7 @@ func MaybeChownDirRecursiveToMinikubeUser(dir string) error {
 	return nil
 }
 
-// ParseKubernetesVersion parses the kubernetes version
+// ParseKubernetesVersion parses the Kubernetes version
 func ParseKubernetesVersion(version string) (semver.Version, error) {
 	return semver.Make(version[1:])
 }

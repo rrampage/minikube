@@ -33,7 +33,7 @@ type LogOptions struct {
 	Follow bool
 }
 
-// Bootstrapper contains all the methods needed to bootstrap a kubernetes cluster
+// Bootstrapper contains all the methods needed to bootstrap a Kubernetes cluster
 type Bootstrapper interface {
 	StartCluster(config.ClusterConfig) error
 	UpdateCluster(config.ClusterConfig) error
@@ -45,7 +45,6 @@ type Bootstrapper interface {
 	// LogCommands returns a map of log type to a command which will display that log.
 	LogCommands(config.ClusterConfig, LogOptions) map[string]string
 	SetupCerts(config.KubernetesConfig, config.Node) error
-	GetKubeletStatus() (string, error)
 	GetAPIServerStatus(string, int) (string, error)
 }
 

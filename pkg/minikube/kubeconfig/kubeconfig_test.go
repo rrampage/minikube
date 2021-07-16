@@ -25,6 +25,7 @@ import (
 
 	"k8s.io/client-go/tools/clientcmd/api"
 	"k8s.io/minikube/pkg/minikube/constants"
+	"k8s.io/minikube/pkg/minikube/localpath"
 
 	"k8s.io/client-go/tools/clientcmd"
 )
@@ -49,6 +50,40 @@ users:
   user:
     client-certificate: /home/la-croix/apiserver.crt
     client-key: /home/la-croix/apiserver.key
+`)
+
+var kubeConfigWithoutHTTPSUpdated = []byte(`
+apiVersion: v1
+clusters:
+- cluster:
+    certificate-authority: /home/la-croix/apiserver.crt
+    server: 192.168.1.1:8080
+  name: la-croix
+- cluster:
+    certificate-authority: /home/la-croix/.minikube/ca.crt
+    server: https://192.168.10.100:8080
+  name: minikube
+contexts:
+- context:
+    cluster: la-croix
+    user: la-croix
+  name: la-croix
+- context:
+    cluster: minikube
+    user: minikube
+  name: minikube
+current-context: minikube
+kind: Config
+preferences: {}
+users:
+- name: la-croix
+  user:
+    client-certificate: /home/la-croix/apiserver.crt
+    client-key: /home/la-croix/apiserver.key
+- name: minikube
+  user:
+    client-certificate: /home/la-croix/.minikube/profiles/minikube/client.crt
+    client-key: /home/la-croix/.minikube/profiles/minikube/client.key
 `)
 
 var kubeConfig192 = []byte(`
@@ -117,6 +152,37 @@ users:
     client-key: /home/la-croix/apiserver.key
 `)
 
+var kubeConfigNoClusters = []byte(`
+apiVersion: v1
+clusters:
+contexts:
+kind: Config
+preferences: {}
+users:
+`)
+
+var kubeConfigNoClustersUpdated = []byte(`
+apiVersion: v1
+clusters:
+- cluster:
+    certificate-authority: /home/la-croix/.minikube/ca.crt
+    server: https://192.168.10.100:8080
+  name: minikube
+contexts:
+- context:
+    cluster: minikube
+    user: minikube
+  name: minikube
+current-context: minikube
+kind: Config
+preferences: {}
+users:
+- name: minikube
+  user:
+    client-certificate: /home/la-croix/.minikube/profiles/minikube/client.crt
+    client-key: /home/la-croix/.minikube/profiles/minikube/client.key
+`)
+
 func TestUpdate(t *testing.T) {
 	setupCfg := &Settings{
 		ClusterName:          "test",
@@ -167,6 +233,13 @@ func TestUpdate(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Error making temp directory %v", err)
 			}
+			defer func() { // clean up tempdir
+				err := os.RemoveAll(tmpDir)
+				if err != nil {
+					t.Errorf("failed to clean up temp folder  %q", tmpDir)
+				}
+			}()
+
 			test.cfg.SetPath(filepath.Join(tmpDir, "kubeconfig"))
 			if len(test.existingCfg) != 0 {
 				if err := ioutil.WriteFile(test.cfg.filePath(), test.existingCfg, 0600); err != nil {
@@ -256,6 +329,7 @@ func TestVerifyEndpoint(t *testing.T) {
 		t.Run(test.description, func(t *testing.T) {
 			t.Parallel()
 			configFilename := tempFile(t, test.existing)
+			defer os.Remove(configFilename)
 			err := VerifyEndpoint("minikube", test.hostname, test.port, configFilename)
 			if err != nil && !test.err {
 				t.Errorf("Got unexpected error: %v", err)
@@ -292,8 +366,8 @@ func TestUpdateIP(t *testing.T) {
 			hostname:    "192.168.10.100",
 			port:        8080,
 			existing:    kubeConfigWithoutHTTPS,
-			err:         true,
-			expCfg:      kubeConfigWithoutHTTPS,
+			status:      true,
+			expCfg:      kubeConfigWithoutHTTPSUpdated,
 		},
 		{
 			description: "same IP",
@@ -318,12 +392,25 @@ func TestUpdateIP(t *testing.T) {
 			status:      true,
 			expCfg:      kubeConfigLocalhost12345,
 		},
+		{
+			description: "no clusters",
+			hostname:    "192.168.10.100",
+			port:        8080,
+			existing:    kubeConfigNoClusters,
+			status:      true,
+			expCfg:      kubeConfigNoClustersUpdated,
+		},
 	}
+
+	os.Setenv(localpath.MinikubeHome, "/home/la-croix")
+
 	for _, test := range tests {
+		test := test
 		t.Run(test.description, func(t *testing.T) {
 			t.Parallel()
 			configFilename := tempFile(t, test.existing)
-			statusActual, err := UpdateEndpoint("minikube", test.hostname, test.port, configFilename)
+			defer os.Remove(configFilename)
+			statusActual, err := UpdateEndpoint("minikube", test.hostname, test.port, configFilename, nil)
 			if err != nil && !test.err {
 				t.Errorf("Got unexpected error: %v", err)
 			}
@@ -332,6 +419,18 @@ func TestUpdateIP(t *testing.T) {
 			}
 			if test.status != statusActual {
 				t.Errorf("Expected status %t, but got %t", test.status, statusActual)
+			}
+
+			actual, err := readOrNew(configFilename)
+			if err != nil {
+				t.Fatal(err)
+			}
+			expected, err := decode(test.expCfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !configEquals(actual, expected) {
+				t.Fatalf("configs did not match: Actual:\n%+v\n Expected:\n%+v", actual, expected)
 			}
 		})
 
@@ -365,7 +464,12 @@ func TestNewConfig(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer os.RemoveAll(dir)
+	defer func() {
+		err := os.RemoveAll(dir)
+		if err != nil {
+			t.Errorf("Failed to remove dir %q: %v", dir, err)
+		}
+	}()
 
 	// setup minikube config
 	expected := api.NewConfig()
@@ -412,6 +516,7 @@ func Test_Endpoint(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.description, func(t *testing.T) {
 			configFilename := tempFile(t, test.cfg)
+			defer os.Remove(configFilename)
 			hostname, port, err := Endpoint("minikube", configFilename)
 			if err != nil && !test.err {
 				t.Errorf("Got unexpected error: %v", err)

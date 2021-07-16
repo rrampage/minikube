@@ -18,6 +18,7 @@ package cmd
 
 import (
 	"bytes"
+	"os"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -42,17 +43,36 @@ func TestGenerateDockerScripts(t *testing.T) {
 	}{
 		{
 			"bash",
-			DockerEnvConfig{profile: "dockerdrver", driver: "docker", hostIP: "127.0.0.1", port: 32842, certsDir: "/certs"},
+			DockerEnvConfig{profile: "dockerdriver", driver: "docker", hostIP: "127.0.0.1", port: 32842, certsDir: "/certs"},
 			nil,
 			`export DOCKER_TLS_VERIFY="1"
 export DOCKER_HOST="tcp://127.0.0.1:32842"
 export DOCKER_CERT_PATH="/certs"
-export MINIKUBE_ACTIVE_DOCKERD="dockerdrver"
+export MINIKUBE_ACTIVE_DOCKERD="dockerdriver"
 
 # To point your shell to minikube's docker-daemon, run:
-# eval $(minikube -p dockerdrver docker-env)
+# eval $(minikube -p dockerdriver docker-env)
 `,
-			`unset DOCKER_TLS_VERIFY DOCKER_HOST DOCKER_CERT_PATH MINIKUBE_ACTIVE_DOCKERD
+			`unset DOCKER_TLS_VERIFY;
+unset DOCKER_HOST;
+unset DOCKER_CERT_PATH;
+unset MINIKUBE_ACTIVE_DOCKERD;
+`,
+		},
+		{
+			"bash",
+			DockerEnvConfig{profile: "dockerdriver", driver: "docker", ssh: true, username: "root", hostname: "host", sshport: 22},
+			nil,
+			`export DOCKER_HOST="ssh://root@host:22"
+export MINIKUBE_ACTIVE_DOCKERD="dockerdriver"
+
+# To point your shell to minikube's docker-daemon, run:
+# eval $(minikube -p dockerdriver docker-env --ssh-host)
+`,
+			`unset DOCKER_TLS_VERIFY;
+unset DOCKER_HOST;
+unset DOCKER_CERT_PATH;
+unset MINIKUBE_ACTIVE_DOCKERD;
 `,
 		},
 		{
@@ -67,7 +87,10 @@ export MINIKUBE_ACTIVE_DOCKERD="bash"
 # To point your shell to minikube's docker-daemon, run:
 # eval $(minikube -p bash docker-env)
 `,
-			`unset DOCKER_TLS_VERIFY DOCKER_HOST DOCKER_CERT_PATH MINIKUBE_ACTIVE_DOCKERD
+			`unset DOCKER_TLS_VERIFY;
+unset DOCKER_HOST;
+unset DOCKER_CERT_PATH;
+unset MINIKUBE_ACTIVE_DOCKERD;
 `,
 		},
 		{
@@ -82,7 +105,10 @@ export MINIKUBE_ACTIVE_DOCKERD="ipv6"
 # To point your shell to minikube's docker-daemon, run:
 # eval $(minikube -p ipv6 docker-env)
 `,
-			`unset DOCKER_TLS_VERIFY DOCKER_HOST DOCKER_CERT_PATH MINIKUBE_ACTIVE_DOCKERD
+			`unset DOCKER_TLS_VERIFY;
+unset DOCKER_HOST;
+unset DOCKER_CERT_PATH;
+unset MINIKUBE_ACTIVE_DOCKERD;
 `,
 		},
 		{
@@ -115,7 +141,10 @@ $Env:MINIKUBE_ACTIVE_DOCKERD = "powershell"
 # & minikube -p powershell docker-env | Invoke-Expression
 `,
 
-			`Remove-Item Env:\\DOCKER_TLS_VERIFY Env:\\DOCKER_HOST Env:\\DOCKER_CERT_PATH Env:\\MINIKUBE_ACTIVE_DOCKERD
+			`Remove-Item Env:\\DOCKER_TLS_VERIFY
+Remove-Item Env:\\DOCKER_HOST
+Remove-Item Env:\\DOCKER_CERT_PATH
+Remove-Item Env:\\MINIKUBE_ACTIVE_DOCKERD
 `,
 		},
 		{
@@ -167,7 +196,11 @@ export NO_PROXY="127.0.0.1"
 # eval $(minikube -p bash-no-proxy docker-env)
 `,
 
-			`unset DOCKER_TLS_VERIFY DOCKER_HOST DOCKER_CERT_PATH MINIKUBE_ACTIVE_DOCKERD NO_PROXY
+			`unset DOCKER_TLS_VERIFY;
+unset DOCKER_HOST;
+unset DOCKER_CERT_PATH;
+unset MINIKUBE_ACTIVE_DOCKERD;
+unset NO_PROXY;
 `,
 		},
 		{
@@ -184,7 +217,11 @@ export no_proxy="127.0.0.1"
 # eval $(minikube -p bash-no-proxy-lower docker-env)
 `,
 
-			`unset DOCKER_TLS_VERIFY DOCKER_HOST DOCKER_CERT_PATH MINIKUBE_ACTIVE_DOCKERD no_proxy
+			`unset DOCKER_TLS_VERIFY;
+unset DOCKER_HOST;
+unset DOCKER_CERT_PATH;
+unset MINIKUBE_ACTIVE_DOCKERD;
+unset no_proxy;
 `,
 		},
 		{
@@ -200,7 +237,11 @@ $Env:no_proxy = "192.168.0.1"
 # & minikube -p powershell-no-proxy-idempotent docker-env | Invoke-Expression
 `,
 
-			`Remove-Item Env:\\DOCKER_TLS_VERIFY Env:\\DOCKER_HOST Env:\\DOCKER_CERT_PATH Env:\\MINIKUBE_ACTIVE_DOCKERD Env:\\no_proxy
+			`Remove-Item Env:\\DOCKER_TLS_VERIFY
+Remove-Item Env:\\DOCKER_HOST
+Remove-Item Env:\\DOCKER_CERT_PATH
+Remove-Item Env:\\MINIKUBE_ACTIVE_DOCKERD
+Remove-Item Env:\\no_proxy
 `,
 		},
 		{
@@ -217,7 +258,26 @@ export NO_PROXY="192.168.0.1,10.0.0.4,127.0.0.1"
 # eval $(minikube -p sh-no-proxy-add docker-env)
 `,
 
-			`unset DOCKER_TLS_VERIFY DOCKER_HOST DOCKER_CERT_PATH MINIKUBE_ACTIVE_DOCKERD NO_PROXY
+			`unset DOCKER_TLS_VERIFY;
+unset DOCKER_HOST;
+unset DOCKER_CERT_PATH;
+unset MINIKUBE_ACTIVE_DOCKERD;
+unset NO_PROXY;
+`,
+		},
+		{
+			"none",
+			DockerEnvConfig{profile: "noneshell", driver: "docker", hostIP: "127.0.0.1", port: 32842, certsDir: "/certs"},
+			nil,
+			`DOCKER_TLS_VERIFY=1
+DOCKER_HOST=tcp://127.0.0.1:32842
+DOCKER_CERT_PATH=/certs
+MINIKUBE_ACTIVE_DOCKERD=noneshell
+`,
+			`DOCKER_TLS_VERIFY
+DOCKER_HOST
+DOCKER_CERT_PATH
+MINIKUBE_ACTIVE_DOCKERD
 `,
 		},
 	}
@@ -245,5 +305,39 @@ export NO_PROXY="192.168.0.1,10.0.0.4,127.0.0.1"
 			}
 
 		})
+	}
+}
+
+func TestValidDockerProxy(t *testing.T) {
+	var tests = []struct {
+		proxy   string
+		isValid bool
+	}{
+		{
+			proxy:   "socks5://192.168.0.1:1080",
+			isValid: true,
+		},
+		{
+			proxy:   "",
+			isValid: true,
+		},
+		{
+			proxy:   "socks://192.168.0.1:1080",
+			isValid: false,
+		},
+		{
+			proxy:   "http://192.168.0.1:1080",
+			isValid: false,
+		},
+	}
+
+	for _, tc := range tests {
+		os.Setenv("ALL_PROXY", tc.proxy)
+		valid := isValidDockerProxy("ALL_PROXY")
+		if tc.isValid && valid != tc.isValid {
+			t.Errorf("Expect %#v to be valid docker proxy", tc.proxy)
+		} else if !tc.isValid && valid != tc.isValid {
+			t.Errorf("Expect %#v to be invalid docker proxy", tc.proxy)
+		}
 	}
 }

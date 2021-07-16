@@ -25,10 +25,10 @@ import (
 	"github.com/spf13/cobra"
 	"k8s.io/minikube/pkg/minikube/exit"
 	"k8s.io/minikube/pkg/minikube/out"
+	"k8s.io/minikube/pkg/minikube/reason"
 )
 
-const longDescription = `
-	Outputs minikube shell completion for the given shell (bash or zsh)
+const longDescription = `Outputs minikube shell completion for the given shell (bash, zsh or fish)
 
 	This depends on the bash-completion binary.  Example installation instructions:
 	OS X:
@@ -37,15 +37,18 @@ const longDescription = `
 		$ minikube completion bash > ~/.minikube-completion  # for bash users
 		$ minikube completion zsh > ~/.minikube-completion  # for zsh users
 		$ source ~/.minikube-completion
+		$ minikube completion fish > ~/.config/fish/completions/minikube.fish # for fish users
 	Ubuntu:
 		$ apt-get install bash-completion
-		$ source /etc/bash-completion
+		$ source /etc/bash_completion
 		$ source <(minikube completion bash) # for bash users
 		$ source <(minikube completion zsh) # for zsh users
+		$ minikube completion fish > ~/.config/fish/completions/minikube.fish # for fish users
 
 	Additionally, you may want to output the completion to a file and source in your .bashrc
 
 	Note for zsh users: [1] zsh completions are only supported in versions of zsh >= 5.2
+	Note for fish users: [2] please refer to this docs for more details https://fishshell.com/docs/current/#tab-completion
 `
 
 const boilerPlate = `
@@ -66,27 +69,58 @@ const boilerPlate = `
 
 var completionCmd = &cobra.Command{
 	Use:   "completion SHELL",
-	Short: "Outputs minikube shell completion for the given shell (bash or zsh)",
+	Short: "Generate command completion for a shell",
 	Long:  longDescription,
 	Run: func(cmd *cobra.Command, args []string) {
 		if len(args) != 1 {
-			exit.UsageT("Usage: minikube completion SHELL")
+			exit.Message(reason.Usage, "Usage: minikube completion SHELL")
 		}
-		if args[0] != "bash" && args[0] != "zsh" {
-			exit.UsageT("Sorry, completion support is not yet implemented for {{.name}}", out.V{"name": args[0]})
-		} else if args[0] == "bash" {
-			err := GenerateBashCompletion(os.Stdout, cmd.Parent())
-			if err != nil {
-				exit.WithError("bash completion failed", err)
-			}
-		} else {
-			err := GenerateZshCompletion(os.Stdout, cmd.Parent())
-			if err != nil {
-				exit.WithError("zsh completion failed", err)
-			}
+		if args[0] != "bash" && args[0] != "zsh" && args[0] != "fish" {
+			exit.Message(reason.Usage, "Sorry, completion support is not yet implemented for {{.name}}", out.V{"name": args[0]})
 		}
-
 	},
+}
+
+var bashCmd = &cobra.Command{
+	Use:   "bash",
+	Short: "bash completion.",
+	Long:  "Generate command completion for bash.",
+	Run: func(cmd *cobra.Command, args []string) {
+		err := GenerateBashCompletion(os.Stdout, cmd.Root())
+		if err != nil {
+			exit.Error(reason.InternalCompletion, "bash completion failed", err)
+		}
+	},
+}
+
+var zshCmd = &cobra.Command{
+	Use:   "zsh",
+	Short: "zsh completion.",
+	Long:  "Generate command completion for zsh.",
+	Run: func(cmd *cobra.Command, args []string) {
+		err := GenerateZshCompletion(os.Stdout, cmd.Root())
+		if err != nil {
+			exit.Error(reason.InternalCompletion, "zsh completion failed", err)
+		}
+	},
+}
+
+var fishCmd = &cobra.Command{
+	Use:   "fish",
+	Short: "fish completion.",
+	Long:  "Generate command completion for fish .",
+	Run: func(cmd *cobra.Command, args []string) {
+		err := GenerateFishCompletion(os.Stdout, cmd.Root())
+		if err != nil {
+			exit.Error(reason.InternalCompletion, "fish completion failed", err)
+		}
+	},
+}
+
+func init() {
+	completionCmd.AddCommand(bashCmd)
+	completionCmd.AddCommand(zshCmd)
+	completionCmd.AddCommand(fishCmd)
 }
 
 // GenerateBashCompletion generates the completion for the bash shell
@@ -275,6 +309,21 @@ __minikube_bash_source <(__minikube_convert_bash_to_zsh)
 	_, err = out.Write([]byte(zshTail))
 	if err != nil {
 		return err
+	}
+
+	return nil
+}
+
+// GenerateFishCompletion generates the completion for the bash shell
+func GenerateFishCompletion(w io.Writer, cmd *cobra.Command) error {
+	_, err := w.Write([]byte(boilerPlate))
+	if err != nil {
+		return err
+	}
+
+	err = cmd.GenFishCompletion(w, true)
+	if err != nil {
+		return errors.Wrap(err, "Error generating fish completion")
 	}
 
 	return nil

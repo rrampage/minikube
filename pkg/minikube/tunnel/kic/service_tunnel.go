@@ -17,13 +17,15 @@ limitations under the License.
 package kic
 
 import (
+	"context"
 	"fmt"
 
-	"github.com/golang/glog"
 	"github.com/pkg/errors"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	typed_core "k8s.io/client-go/kubernetes/typed/core/v1"
+
+	"k8s.io/klog/v2"
 )
 
 // ServiceTunnel ...
@@ -45,7 +47,7 @@ func NewServiceTunnel(sshPort, sshKey string, v1Core typed_core.CoreV1Interface)
 
 // Start ...
 func (t *ServiceTunnel) Start(svcName, namespace string) ([]string, error) {
-	svc, err := t.v1Core.Services(namespace).Get(svcName, metav1.GetOptions{})
+	svc, err := t.v1Core.Services(namespace).Get(context.Background(), svcName, metav1.GetOptions{})
 	if err != nil {
 		return nil, errors.Wrapf(err, "Service %s was not found in %q namespace. You may select another namespace by using 'minikube service %s -n <namespace>", svcName, namespace, svcName)
 	}
@@ -58,7 +60,7 @@ func (t *ServiceTunnel) Start(svcName, namespace string) ([]string, error) {
 	go func() {
 		err = t.sshConn.startAndWait()
 		if err != nil {
-			glog.Errorf("error starting ssh tunnel: %v", err)
+			klog.Errorf("error starting ssh tunnel: %v", err)
 		}
 	}()
 

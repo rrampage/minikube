@@ -18,10 +18,12 @@ limitations under the License.
 package bsutil
 
 import (
+	"os/exec"
 	"path"
 
+	"github.com/pkg/errors"
 	"k8s.io/minikube/pkg/minikube/assets"
-	"k8s.io/minikube/pkg/minikube/config"
+	"k8s.io/minikube/pkg/minikube/command"
 	"k8s.io/minikube/pkg/minikube/vmpath"
 )
 
@@ -29,26 +31,31 @@ import (
 var KubeadmYamlPath = path.Join(vmpath.GuestEphemeralDir, "kubeadm.yaml")
 
 const (
-	//DefaultCNIConfigPath is the configuration file for CNI networks
-	DefaultCNIConfigPath = "/etc/cni/net.d/k8s.conf"
 	// KubeletServiceFile is the file for the systemd kubelet.service
 	KubeletServiceFile = "/lib/systemd/system/kubelet.service"
 	// KubeletSystemdConfFile is config for the systemd kubelet.service
 	KubeletSystemdConfFile = "/etc/systemd/system/kubelet.service.d/10-kubeadm.conf"
+	// InitRestartWrapper is ...
+	InitRestartWrapper = "/etc/init.d/.restart_wrapper.sh"
+	// KubeletInitPath is where Sys-V style init script is installed
+	KubeletInitPath = "/etc/init.d/kubelet"
 )
 
-// ConfigFileAssets returns configuration file assets
-func ConfigFileAssets(cfg config.KubernetesConfig, kubeadm []byte, kubelet []byte, kubeletSvc []byte, defaultCNIConfig []byte) []assets.CopyableFile {
-	fs := []assets.CopyableFile{
-		assets.NewMemoryAssetTarget(kubeadm, KubeadmYamlPath+".new", "0640"),
-		assets.NewMemoryAssetTarget(kubelet, KubeletSystemdConfFile+".new", "0644"),
-		assets.NewMemoryAssetTarget(kubeletSvc, KubeletServiceFile+".new", "0644"),
+// CopyFiles combines mkdir requests into a single call to reduce load
+func CopyFiles(runner command.Runner, files []assets.CopyableFile) error {
+	dirs := []string{}
+	for _, f := range files {
+		dirs = append(dirs, f.GetTargetDir())
 	}
-	// Copy the default CNI config (k8s.conf), so that kubelet can successfully
-	// start a Pod in the case a user hasn't manually installed any CNI plugin
-	// and minikube was started with "--extra-config=kubelet.network-plugin=cni".
-	if defaultCNIConfig != nil {
-		fs = append(fs, assets.NewMemoryAssetTarget(defaultCNIConfig, DefaultCNIConfigPath, "0644"))
+	args := append([]string{"mkdir", "-p"}, dirs...)
+	if _, err := runner.RunCmd(exec.Command("sudo", args...)); err != nil {
+		return errors.Wrap(err, "mkdir")
 	}
-	return fs
+
+	for _, f := range files {
+		if err := runner.Copy(f); err != nil {
+			return errors.Wrapf(err, "copy")
+		}
+	}
+	return nil
 }

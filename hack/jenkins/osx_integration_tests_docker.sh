@@ -26,15 +26,26 @@
 
 set -e
 
-OS_ARCH="darwin-amd64"
-VM_DRIVER="docker"
+ARCH="amd64"
+OS="darwin"
+DRIVER="docker"
 JOB_NAME="Docker_macOS"
-EXTRA_START_ARGS=""
-EXPECTED_DEFAULT_DRIVER="hyperkit"
+EXTRA_TEST_ARGS=""
+EXPECTED_DEFAULT_DRIVER="docker"
+EXTERNAL="yes"
 
-
-# restart docker on mac for a fresh test
-osascript -e 'quit app "Docker"'; open -a Docker ; while [ -z "$(docker info 2> /dev/null )" ]; do printf "."; sleep 1; done; echo "" || true
+begin=$(date +%s)
+while [ -z "$(docker info 2> /dev/null )" ];
+do
+  printf "."
+  sleep 1
+  now=$(date +%s)
+  elapsed=$((now-begun))
+  if [ $elapsed -ge 120 ];
+  then
+    break
+  fi
+done
 
 mkdir -p cron && gsutil -qm rsync "gs://minikube-builds/${MINIKUBE_LOCATION}/cron" cron || echo "FAILED TO GET CRON FILES"
 install cron/cleanup_and_reboot_Darwin.sh $HOME/cleanup_and_reboot.sh || echo "FAILED TO INSTALL CLEANUP"

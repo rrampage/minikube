@@ -19,17 +19,22 @@ To do so, we use the [Docker Machine](https://github.com/docker/machine) library
 * [VirtualBox]({{<ref "virtualbox.md">}}) - VM
 * [None]({{<ref "none.md">}}) -  bare-metal
 * [Podman]({{<ref "podman.md">}}) - container (experimental)
+* [SSH]({{<ref "ssh.md">}}) - remote ssh
+
 
 ## macOS
 
-* [Hyperkit]({{<ref "hyperkit.md">}}) - VM (preferred)
-* [Docker]({{<ref "docker.md">}}) - VM + Container
-* [VirtualBox]({{<ref "virtualbox.md">}}) - FVM
-* [VMware]({{<ref "parallels.md">}}) - VM
+* [Docker]({{<ref "docker.md">}}) - VM + Container (preferred)
+* [Hyperkit]({{<ref "hyperkit.md">}}) - VM
+* [VirtualBox]({{<ref "virtualbox.md">}}) - VM
+* [Parallels]({{<ref "parallels.md">}}) - VM
 * [VMware]({{<ref "vmware.md">}}) - VM
+* [SSH]({{<ref "ssh.md">}}) - remote ssh
 
 ## Windows
 
 * [Hyper-V]({{<ref "hyperv.md">}}) - VM (preferred)
 * [Docker]({{<ref "docker.md">}}) - VM + Container (preferred)
 * [VirtualBox]({{<ref "virtualbox.md">}}) - VM
+* [VMware]({{<ref "vmware.md">}}) - VM
+* [SSH]({{<ref "ssh.md">}}) - remote ssh

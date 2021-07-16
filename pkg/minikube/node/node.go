@@ -17,11 +17,16 @@ limitations under the License.
 package node
 
 import (
+	"context"
 	"fmt"
+	"os/exec"
 
 	"github.com/pkg/errors"
 	"github.com/spf13/viper"
 
+	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/klog/v2"
+	"k8s.io/minikube/pkg/kapi"
 	"k8s.io/minikube/pkg/minikube/config"
 	"k8s.io/minikube/pkg/minikube/driver"
 	"k8s.io/minikube/pkg/minikube/machine"
@@ -34,40 +39,141 @@ const (
 )
 
 // Add adds a new node config to an existing cluster.
-func Add(cc *config.ClusterConfig, n config.Node) error {
+func Add(cc *config.ClusterConfig, n config.Node, delOnFail bool) error {
+	profiles, err := config.ListValidProfiles()
+	if err != nil {
+		return err
+	}
+
+	machineName := config.MachineName(*cc, n)
+	for _, p := range profiles {
+		if p.Config.Name == cc.Name {
+			continue
+		}
+
+		for _, existNode := range p.Config.Nodes {
+			if machineName == config.MachineName(*p.Config, existNode) {
+				return errors.Errorf("Node %s already exists in %s profile", machineName, p.Name)
+			}
+		}
+	}
+
 	if err := config.SaveNode(cc, &n); err != nil {
 		return errors.Wrap(err, "save node")
 	}
 
-	_, err := Start(*cc, n, nil, false)
+	r, p, m, h, err := Provision(cc, &n, false, delOnFail)
+	if err != nil {
+		return err
+	}
+	s := Starter{
+		Runner:         r,
+		PreExists:      p,
+		MachineAPI:     m,
+		Host:           h,
+		Cfg:            cc,
+		Node:           &n,
+		ExistingAddons: nil,
+	}
+
+	_, err = Start(s, false)
 	return err
 }
 
-// Delete stops and deletes the given node from the given cluster
-func Delete(cc config.ClusterConfig, name string) error {
-	n, index, err := Retrieve(&cc, name)
+// drainNode drains then deletes (removes) node from cluster.
+func drainNode(cc config.ClusterConfig, name string) (*config.Node, error) {
+	n, _, err := Retrieve(cc, name)
 	if err != nil {
-		return errors.Wrap(err, "retrieve")
+		return n, errors.Wrap(err, "retrieve")
 	}
 
+	m := config.MachineName(cc, *n)
 	api, err := machine.NewAPIClient()
 	if err != nil {
-		return err
+		return n, err
 	}
 
-	err = machine.DeleteHost(api, driver.MachineName(cc, *n))
+	// grab control plane to use kubeconfig
+	host, err := machine.LoadHost(api, cc.Name)
 	if err != nil {
-		return err
+		return n, err
+	}
+
+	runner, err := machine.CommandRunner(host)
+	if err != nil {
+		return n, err
+	}
+
+	// kubectl drain with extra options to prevent ending up stuck in the process
+	// ref: https://kubernetes.io/docs/reference/generated/kubectl/kubectl-commands#drain
+	kubectl := kapi.KubectlBinaryPath(cc.KubernetesConfig.KubernetesVersion)
+	cmd := exec.Command("sudo", "KUBECONFIG=/var/lib/minikube/kubeconfig", kubectl, "drain", m,
+		"--force", "--grace-period=1", "--skip-wait-for-delete-timeout=1", "--disable-eviction", "--ignore-daemonsets", "--delete-emptydir-data", "--delete-local-data")
+	if _, err := runner.RunCmd(cmd); err != nil {
+		klog.Warningf("unable to drain node %q: %v", name, err)
+	} else {
+		klog.Infof("successfully drained node %q", name)
+	}
+
+	// kubectl delete
+	client, err := kapi.Client(cc.Name)
+	if err != nil {
+		return n, err
+	}
+
+	// set 'GracePeriodSeconds: 0' option to delete node immediately (ie, w/o waiting)
+	var grace *int64
+	err = client.CoreV1().Nodes().Delete(context.Background(), m, v1.DeleteOptions{GracePeriodSeconds: grace})
+	if err != nil {
+		klog.Errorf("unable to delete node %q: %v", name, err)
+		return n, err
+	}
+	klog.Infof("successfully deleted node %q", name)
+
+	return n, nil
+}
+
+// Delete calls drainNode to remove node from cluster and deletes the host.
+func Delete(cc config.ClusterConfig, name string) (*config.Node, error) {
+	n, err := drainNode(cc, name)
+	if err != nil {
+		return n, err
+	}
+
+	m := config.MachineName(cc, *n)
+	api, err := machine.NewAPIClient()
+	if err != nil {
+		return n, err
+	}
+
+	err = machine.DeleteHost(api, m)
+	if err != nil {
+		return n, err
+	}
+
+	_, index, err := Retrieve(cc, name)
+	if err != nil {
+		return n, errors.Wrap(err, "retrieve")
 	}
 
 	cc.Nodes = append(cc.Nodes[:index], cc.Nodes[index+1:]...)
-	return config.SaveProfile(viper.GetString(config.ProfileName), &cc)
+	return n, config.SaveProfile(viper.GetString(config.ProfileName), &cc)
 }
 
 // Retrieve finds the node by name in the given cluster
-func Retrieve(cc *config.ClusterConfig, name string) (*config.Node, int, error) {
+func Retrieve(cc config.ClusterConfig, name string) (*config.Node, int, error) {
+	if driver.BareMetal(cc.Driver) {
+		name = "m01"
+	}
+
 	for i, n := range cc.Nodes {
 		if n.Name == name {
+			return &n, i, nil
+		}
+
+		// Accept full machine name as well as just node name
+		if config.MachineName(cc, n) == name {
+			klog.Infof("Couldn't find node name %s, but found it as a machine name, returning it anyway.", name)
 			return &n, i, nil
 		}
 	}

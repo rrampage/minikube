@@ -30,7 +30,7 @@ import (
 
 func TestSetupCerts(t *testing.T) {
 	tempDir := tests.MakeTempDir()
-	defer os.RemoveAll(tempDir)
+	defer tests.RemoveTempDir(tempDir)
 
 	k8s := config.KubernetesConfig{
 		APIServerName: constants.APIServerName,
@@ -51,14 +51,13 @@ func TestSetupCerts(t *testing.T) {
 	}
 
 	expected := map[string]string{
-		`sudo /bin/bash -c "test -f /usr/share/ca-certificates/mycert.pem && ln -fs /usr/share/ca-certificates/mycert.pem /etc/ssl/certs/mycert.pem"`:             "-",
-		`sudo /bin/bash -c "test -f /usr/share/ca-certificates/minikubeCA.pem && ln -fs /usr/share/ca-certificates/minikubeCA.pem /etc/ssl/certs/minikubeCA.pem"`: "-",
+		`sudo /bin/bash -c "test -s /usr/share/ca-certificates/mycert.pem && ln -fs /usr/share/ca-certificates/mycert.pem /etc/ssl/certs/mycert.pem"`:             "-",
+		`sudo /bin/bash -c "test -s /usr/share/ca-certificates/minikubeCA.pem && ln -fs /usr/share/ca-certificates/minikubeCA.pem /etc/ssl/certs/minikubeCA.pem"`: "-",
 	}
 	f := command.NewFakeCommandRunner()
 	f.SetCommandToOutput(expected)
 
-	_, err := SetupCerts(f, k8s, config.Node{})
-	if err != nil {
+	if err := SetupCerts(f, k8s, config.Node{}); err != nil {
 		t.Fatalf("Error starting cluster: %v", err)
 	}
 }

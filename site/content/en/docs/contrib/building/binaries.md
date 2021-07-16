@@ -7,7 +7,7 @@ weight: 2
 
 ## Prerequisites
 
-* A recent Go distribution (>=1.12)
+* A recent Go distribution (>=1.16)
 * If you are on Windows, you'll need Docker to be installed.
 * 4GB of RAM
 
@@ -64,7 +64,9 @@ See [Building the minikube ISO](../iso)
 We publish CI builds of minikube, built at every Pull Request. Builds are available at (substitute in the relevant PR number):
 
 - <https://storage.googleapis.com/minikube-builds/PR_NUMBER/minikube-darwin-amd64>
+- <https://storage.googleapis.com/minikube-builds/PR_NUMBER/minikube-darwin-arm64>
 - <https://storage.googleapis.com/minikube-builds/PR_NUMBER/minikube-linux-amd64>
+- <https://storage.googleapis.com/minikube-builds/PR_NUMBER/minikube-linux-arm64>
 - <https://storage.googleapis.com/minikube-builds/PR_NUMBER/minikube-windows-amd64.exe>
 
 We also publish CI builds of minikube-iso, built at every Pull Request that touches deploy/iso/minikube-iso.  Builds are available at:

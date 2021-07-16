@@ -21,6 +21,8 @@ import (
 	"k8s.io/minikube/pkg/addons"
 	"k8s.io/minikube/pkg/minikube/exit"
 	"k8s.io/minikube/pkg/minikube/out"
+	"k8s.io/minikube/pkg/minikube/reason"
+	"k8s.io/minikube/pkg/minikube/style"
 )
 
 var addonsDisableCmd = &cobra.Command{
@@ -29,15 +31,18 @@ var addonsDisableCmd = &cobra.Command{
 	Long:  "Disables the addon w/ADDON_NAME within minikube (example: minikube addons disable dashboard). For a list of available addons use: minikube addons list ",
 	Run: func(cmd *cobra.Command, args []string) {
 		if len(args) != 1 {
-			exit.UsageT("usage: minikube addons disable ADDON_NAME")
+			exit.Message(reason.Usage, "usage: minikube addons disable ADDON_NAME")
 		}
 
 		addon := args[0]
-		err := addons.Set(addon, "false", ClusterFlagValue())
-		if err != nil {
-			exit.WithError("disable failed", err)
+		if addon == "heapster" {
+			exit.Message(reason.AddonUnsupported, "The heapster addon is depreciated. please try to disable metrics-server instead")
 		}
-		out.T(out.AddonDisable, `"The '{{.minikube_addon}}' addon is disabled`, out.V{"minikube_addon": addon})
+		err := addons.SetAndSave(ClusterFlagValue(), addon, "false")
+		if err != nil {
+			exit.Error(reason.InternalAddonDisable, "disable failed", err)
+		}
+		out.Step(style.AddonDisable, `"The '{{.minikube_addon}}' addon is disabled`, out.V{"minikube_addon": addon})
 	},
 }
 

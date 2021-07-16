@@ -73,14 +73,27 @@ networking:
 ---
 apiVersion: kubelet.config.k8s.io/v1beta1
 kind: KubeletConfiguration
+authentication:
+  x509:
+    clientCAFile: {{.ClientCAFile}}
+cgroupDriver: {{.CgroupDriver}}
+clusterDomain: "{{if .DNSDomain}}{{.DNSDomain}}{{else}}cluster.local{{end}}"
 # disable disk resource management by default
 imageGCHighThresholdPercent: 100
 evictionHard:
   nodefs.available: "0%"
   nodefs.inodesFree: "0%"
   imagefs.available: "0%"
+failSwapOn: false
+staticPodPath: {{.StaticPodPath}}
 ---
 apiVersion: kubeproxy.config.k8s.io/v1alpha1
 kind: KubeProxyConfiguration
-metricsBindAddress: {{.AdvertiseAddress}}:10249
+clusterCIDR: "{{.PodSubnet }}"
+metricsBindAddress: 0.0.0.0:10249
+conntrack:
+  maxPerCore: 0
+{{- range $i, $val := printMapInOrder .KubeProxyOptions ": " }}
+{{$val}}
+{{- end}}
 `))

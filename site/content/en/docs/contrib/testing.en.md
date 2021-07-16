@@ -6,7 +6,25 @@ description: >
   How to run tests
 ---
 
-### Unit Tests
+## Prerequisites
+
+* Go distribution
+  * Specific version depends on minikube version.
+  * The current dependency version can be found here : [master branch's go.mod file](https://github.com/kubernetes/minikube/blob/master/go.mod).
+* If you are on Linux, you will need to install `libvirt-dev`, since unit tests need kvm2 driver:
+
+```shell
+# For Debian based
+sudo apt-get install libvirt-dev
+
+# For Centos
+yum install libvirt-devel
+
+# For Fedora
+dnf install libvirt-devel
+```
+
+## Unit Tests
 
 Unit tests are run on Travis before code is merged. To run as part of a development cycle:
 
@@ -14,10 +32,11 @@ Unit tests are run on Travis before code is merged. To run as part of a developm
 make test
 ```
 
-### Integration Tests
+## Integration Tests
 
-Integration tests are currently run manually.
-To run them, build the binary and run the tests:
+### The basics
+
+From the minikube root directory, build the binary and run the tests:
 
 ```shell
 make integration
@@ -29,7 +48,35 @@ You may find it useful to set various options to test only a particular test aga
  env TEST_ARGS="-minikube-start-args=--driver=hyperkit -test.run TestStartStop" make integration
  ```
 
-### Conformance Tests
+### Quickly iterating on a single test
+
+Run a single test on an active cluster:
+
+```shell
+make integration -e TEST_ARGS="-test.run TestFunctional/parallel/MountCmd --profile=minikube --cleanup=false"
+```
+
+WARNING: For this to work repeatedly, the test must be written so that it cleans up after itself.
+
+The `--cleanup=false` test arg ensures that the cluster will not be deleted after the test is run.
+
+See [main_test.go](https://github.com/kubernetes/minikube/blob/master/test/integration/main_test.go) for details.
+
+### Disabling parallelism
+
+```shell
+make integration -e TEST_ARGS="-test.parallel=1"
+```
+
+### Testing philosophy
+
+- Tests should be so simple as to be correct by inspection
+- Readers should need to read only the test body to understand the test
+- Top-to-bottom readability is more important than code de-duplication
+
+Tests are typically read with a great air of skepticism, because chances are they are being read only when things are broken.
+
+## Conformance Tests
 
 These are Kubernetes tests that run against an arbitrary cluster and exercise a wide range of Kubernetes features.
 You can run these against minikube by following these steps:

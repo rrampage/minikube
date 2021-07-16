@@ -18,6 +18,7 @@ package service
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"net/url"
@@ -28,36 +29,30 @@ import (
 	"time"
 
 	"github.com/docker/machine/libmachine"
-	"github.com/golang/glog"
 	"github.com/olekukonko/tablewriter"
 	"github.com/pkg/errors"
-	"github.com/spf13/viper"
 	core "k8s.io/api/core/v1"
 	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/client-go/kubernetes"
 	typed_core "k8s.io/client-go/kubernetes/typed/core/v1"
-	"k8s.io/client-go/tools/clientcmd"
-	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
-	"k8s.io/minikube/pkg/minikube/config"
+	"k8s.io/klog/v2"
+	"k8s.io/minikube/pkg/kapi"
 	"k8s.io/minikube/pkg/minikube/machine"
 	"k8s.io/minikube/pkg/minikube/out"
-	"k8s.io/minikube/pkg/minikube/proxy"
+	"k8s.io/minikube/pkg/minikube/style"
 	"k8s.io/minikube/pkg/util/retry"
 )
 
 const (
-	defaultK8sClientTimeout = 60 * time.Second
 	// DefaultWait is the default wait time, in seconds
 	DefaultWait = 2
 	// DefaultInterval is the default interval, in seconds
 	DefaultInterval = 1
 )
 
-// K8sClient represents a kubernetes client
+// K8sClient represents a Kubernetes client
 type K8sClient interface {
-	GetCoreClient() (typed_core.CoreV1Interface, error)
-	GetClientset(timeout time.Duration) (*kubernetes.Clientset, error)
+	GetCoreClient(string) (typed_core.CoreV1Interface, error)
 }
 
 // K8sClientGetter can get a K8sClient
@@ -71,37 +66,12 @@ func init() {
 }
 
 // GetCoreClient returns a core client
-func (k *K8sClientGetter) GetCoreClient() (typed_core.CoreV1Interface, error) {
-	client, err := k.GetClientset(defaultK8sClientTimeout)
+func (k *K8sClientGetter) GetCoreClient(context string) (typed_core.CoreV1Interface, error) {
+	client, err := kapi.Client(context)
 	if err != nil {
-		return nil, errors.Wrap(err, "getting clientset")
+		return nil, errors.Wrap(err, "client")
 	}
 	return client.CoreV1(), nil
-}
-
-// GetClientset returns a clientset
-func (*K8sClientGetter) GetClientset(timeout time.Duration) (*kubernetes.Clientset, error) {
-	loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
-	profile := viper.GetString(config.ProfileName)
-	configOverrides := &clientcmd.ConfigOverrides{
-		Context: clientcmdapi.Context{
-			Cluster:  profile,
-			AuthInfo: profile,
-		},
-	}
-	kubeConfig := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(loadingRules, configOverrides)
-	clientConfig, err := kubeConfig.ClientConfig()
-	if err != nil {
-		return nil, fmt.Errorf("kubeConfig: %v", err)
-	}
-	clientConfig.Timeout = timeout
-	clientConfig = proxy.UpdateTransport(clientConfig)
-	client, err := kubernetes.NewForConfig(clientConfig)
-	if err != nil {
-		return nil, errors.Wrap(err, "client from config")
-	}
-
-	return client, nil
 }
 
 // SvcURL represents a service URL. Each item in the URLs field combines the service URL with one of the configured
@@ -119,8 +89,8 @@ type URLs []SvcURL
 
 // GetServiceURLs returns a SvcURL object for every service in a particular namespace.
 // Accepts a template for formatting
-func GetServiceURLs(api libmachine.API, namespace string, t *template.Template) (URLs, error) {
-	host, err := machine.LoadHost(api, viper.GetString(config.ProfileName))
+func GetServiceURLs(api libmachine.API, cname string, namespace string, t *template.Template) (URLs, error) {
+	host, err := machine.LoadHost(api, cname)
 	if err != nil {
 		return nil, err
 	}
@@ -130,14 +100,14 @@ func GetServiceURLs(api libmachine.API, namespace string, t *template.Template) 
 		return nil, err
 	}
 
-	client, err := K8s.GetCoreClient()
+	client, err := K8s.GetCoreClient(cname)
 	if err != nil {
 		return nil, err
 	}
 
 	serviceInterface := client.Services(namespace)
 
-	svcs, err := serviceInterface.List(meta.ListOptions{})
+	svcs, err := serviceInterface.List(context.Background(), meta.ListOptions{})
 	if err != nil {
 		return nil, err
 	}
@@ -154,9 +124,9 @@ func GetServiceURLs(api libmachine.API, namespace string, t *template.Template) 
 	return serviceURLs, nil
 }
 
-// GetServiceURLsForService returns a SvcUrl object for a service in a namespace. Supports optional formatting.
-func GetServiceURLsForService(api libmachine.API, namespace, service string, t *template.Template) (SvcURL, error) {
-	host, err := machine.LoadHost(api, viper.GetString(config.ProfileName))
+// GetServiceURLsForService returns a SvcURL object for a service in a namespace. Supports optional formatting.
+func GetServiceURLsForService(api libmachine.API, cname string, namespace, service string, t *template.Template) (SvcURL, error) {
+	host, err := machine.LoadHost(api, cname)
 	if err != nil {
 		return SvcURL{}, errors.Wrap(err, "Error checking if api exist and loading it")
 	}
@@ -166,7 +136,7 @@ func GetServiceURLsForService(api libmachine.API, namespace, service string, t *
 		return SvcURL{}, errors.Wrap(err, "Error getting ip from host")
 	}
 
-	client, err := K8s.GetCoreClient()
+	client, err := K8s.GetCoreClient(cname)
 	if err != nil {
 		return SvcURL{}, err
 	}
@@ -179,12 +149,12 @@ func printURLsForService(c typed_core.CoreV1Interface, ip, service, namespace st
 		return SvcURL{}, errors.New("Error, attempted to generate service url with nil --format template")
 	}
 
-	svc, err := c.Services(namespace).Get(service, meta.GetOptions{})
+	svc, err := c.Services(namespace).Get(context.Background(), service, meta.GetOptions{})
 	if err != nil {
 		return SvcURL{}, errors.Wrapf(err, "service '%s' could not be found running", service)
 	}
 
-	endpoints, err := c.Endpoints(namespace).Get(service, meta.GetOptions{})
+	endpoints, err := c.Endpoints(namespace).Get(context.Background(), service, meta.GetOptions{})
 	m := make(map[int32]string)
 	if err == nil && endpoints != nil && len(endpoints.Subsets) > 0 {
 		for _, ept := range endpoints.Subsets {
@@ -226,13 +196,13 @@ func printURLsForService(c typed_core.CoreV1Interface, ip, service, namespace st
 }
 
 // CheckService checks if a service is listening on a port.
-func CheckService(namespace string, service string) error {
-	client, err := K8s.GetCoreClient()
+func CheckService(cname string, namespace string, service string) error {
+	client, err := K8s.GetCoreClient(cname)
 	if err != nil {
-		return errors.Wrap(err, "Error getting kubernetes client")
+		return errors.Wrap(err, "Error getting Kubernetes client")
 	}
 
-	svc, err := client.Services(namespace).Get(service, meta.GetOptions{})
+	svc, err := client.Services(namespace).Get(context.Background(), service, meta.GetOptions{})
 	if err != nil {
 		return &retry.RetriableError{
 			Err: errors.Wrapf(err, "Error getting service %s", service),
@@ -241,7 +211,7 @@ func CheckService(namespace string, service string) error {
 	if len(svc.Spec.Ports) == 0 {
 		return fmt.Errorf("%s:%s has no ports", namespace, service)
 	}
-	glog.Infof("Found service: %+v", svc)
+	klog.Infof("Found service: %+v", svc)
 	return nil
 }
 
@@ -283,7 +253,7 @@ func (t SVCNotFoundError) Error() string {
 }
 
 // WaitForService waits for a service, and return the urls when available
-func WaitForService(api libmachine.API, namespace string, service string, urlTemplate *template.Template, urlMode bool, https bool,
+func WaitForService(api libmachine.API, cname string, namespace string, service string, urlTemplate *template.Template, urlMode bool, https bool,
 	wait int, interval int) ([]string, error) {
 	var urlList []string
 	// Convert "Amount of time to wait" and "interval of each check" to attempts
@@ -291,18 +261,18 @@ func WaitForService(api libmachine.API, namespace string, service string, urlTem
 		interval = 1
 	}
 
-	err := CheckService(namespace, service)
+	err := CheckService(cname, namespace, service)
 	if err != nil {
 		return nil, &SVCNotFoundError{err}
 	}
 
-	chkSVC := func() error { return CheckService(namespace, service) }
+	chkSVC := func() error { return CheckService(cname, namespace, service) }
 
 	if err := retry.Expo(chkSVC, time.Duration(interval)*time.Second, time.Duration(wait)*time.Second); err != nil {
 		return nil, &SVCNotFoundError{err}
 	}
 
-	serviceURL, err := GetServiceURLsForService(api, namespace, service, urlTemplate)
+	serviceURL, err := GetServiceURLsForService(api, cname, namespace, service, urlTemplate)
 	if err != nil {
 		return urlList, errors.Wrap(err, "Check that minikube is running and that you have specified the correct namespace")
 	}
@@ -318,7 +288,7 @@ func WaitForService(api libmachine.API, namespace string, service string, urlTem
 	}
 
 	if len(serviceURL.URLs) == 0 {
-		out.T(out.Sad, "service {{.namespace_name}}/{{.service_name}} has no node port", out.V{"namespace_name": namespace, "service_name": service})
+		out.Styled(style.Sad, "service {{.namespace_name}}/{{.service_name}} has no node port", out.V{"namespace_name": namespace, "service_name": service})
 		return urlList, nil
 	}
 
@@ -330,8 +300,8 @@ func WaitForService(api libmachine.API, namespace string, service string, urlTem
 }
 
 // GetServiceListByLabel returns a ServiceList by label
-func GetServiceListByLabel(namespace string, key string, value string) (*core.ServiceList, error) {
-	client, err := K8s.GetCoreClient()
+func GetServiceListByLabel(cname string, namespace string, key string, value string) (*core.ServiceList, error) {
+	client, err := K8s.GetCoreClient(cname)
 	if err != nil {
 		return &core.ServiceList{}, &retry.RetriableError{Err: err}
 	}
@@ -340,7 +310,7 @@ func GetServiceListByLabel(namespace string, key string, value string) (*core.Se
 
 func getServiceListFromServicesByLabel(services typed_core.ServiceInterface, key string, value string) (*core.ServiceList, error) {
 	selector := labels.SelectorFromSet(labels.Set(map[string]string{key: value}))
-	serviceList, err := services.List(meta.ListOptions{LabelSelector: selector.String()})
+	serviceList, err := services.List(context.Background(), meta.ListOptions{LabelSelector: selector.String()})
 	if err != nil {
 		return &core.ServiceList{}, &retry.RetriableError{Err: err}
 	}
@@ -349,21 +319,21 @@ func getServiceListFromServicesByLabel(services typed_core.ServiceInterface, key
 }
 
 // CreateSecret creates or modifies secrets
-func CreateSecret(namespace, name string, dataValues map[string]string, labels map[string]string) error {
-	client, err := K8s.GetCoreClient()
+func CreateSecret(cname string, namespace, name string, dataValues map[string]string, labels map[string]string) error {
+	client, err := K8s.GetCoreClient(cname)
 	if err != nil {
 		return &retry.RetriableError{Err: err}
 	}
 
 	secrets := client.Secrets(namespace)
-	secret, err := secrets.Get(name, meta.GetOptions{})
+	secret, err := secrets.Get(context.Background(), name, meta.GetOptions{})
 	if err != nil {
-		glog.Infof("Failed to retrieve existing secret: %v", err)
+		klog.Infof("Failed to retrieve existing secret: %v", err)
 	}
 
 	// Delete existing secret
 	if len(secret.Name) > 0 {
-		err = DeleteSecret(namespace, name)
+		err = DeleteSecret(cname, namespace, name)
 		if err != nil {
 			return &retry.RetriableError{Err: err}
 		}
@@ -385,7 +355,7 @@ func CreateSecret(namespace, name string, dataValues map[string]string, labels m
 		Type: core.SecretTypeOpaque,
 	}
 
-	_, err = secrets.Create(secretObj)
+	_, err = secrets.Create(context.Background(), secretObj, meta.CreateOptions{})
 	if err != nil {
 		return &retry.RetriableError{Err: err}
 	}
@@ -394,14 +364,14 @@ func CreateSecret(namespace, name string, dataValues map[string]string, labels m
 }
 
 // DeleteSecret deletes a secret from a namespace
-func DeleteSecret(namespace, name string) error {
-	client, err := K8s.GetCoreClient()
+func DeleteSecret(cname string, namespace, name string) error {
+	client, err := K8s.GetCoreClient(cname)
 	if err != nil {
 		return &retry.RetriableError{Err: err}
 	}
 
 	secrets := client.Secrets(namespace)
-	err = secrets.Delete(name, &meta.DeleteOptions{})
+	err = secrets.Delete(context.Background(), name, meta.DeleteOptions{})
 	if err != nil {
 		return &retry.RetriableError{Err: err}
 	}

@@ -21,19 +21,19 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"runtime"
 	"strconv"
-	"time"
 
-	"github.com/golang/glog"
 	"github.com/spf13/cobra"
 
+	"k8s.io/klog/v2"
 	"k8s.io/minikube/pkg/drivers/kic/oci"
+	"k8s.io/minikube/pkg/kapi"
 	"k8s.io/minikube/pkg/minikube/config"
+	"k8s.io/minikube/pkg/minikube/driver"
 	"k8s.io/minikube/pkg/minikube/exit"
 	"k8s.io/minikube/pkg/minikube/localpath"
 	"k8s.io/minikube/pkg/minikube/mustload"
-	"k8s.io/minikube/pkg/minikube/service"
+	"k8s.io/minikube/pkg/minikube/reason"
 	"k8s.io/minikube/pkg/minikube/tunnel"
 	"k8s.io/minikube/pkg/minikube/tunnel/kic"
 )
@@ -43,7 +43,7 @@ var cleanup bool
 // tunnelCmd represents the tunnel command
 var tunnelCmd = &cobra.Command{
 	Use:   "tunnel",
-	Short: "tunnel makes services of type LoadBalancer accessible on localhost",
+	Short: "Connect to LoadBalancer services",
 	Long:  `tunnel creates a route to services deployed with type LoadBalancer and sets their Ingress to their ClusterIP. for a detailed example see https://minikube.sigs.k8s.io/docs/tasks/loadbalancer`,
 	PersistentPreRun: func(cmd *cobra.Command, args []string) {
 		RootCmd.PersistentPreRun(cmd, args)
@@ -54,20 +54,19 @@ var tunnelCmd = &cobra.Command{
 		co := mustload.Healthy(cname)
 
 		if cleanup {
-			glog.Info("Checking for tunnels to cleanup...")
+			klog.Info("Checking for tunnels to cleanup...")
 			if err := manager.CleanupNotRunningTunnels(); err != nil {
-				glog.Errorf("error cleaning up: %s", err)
+				klog.Errorf("error cleaning up: %s", err)
 			}
-			return
 		}
 
 		// Tunnel uses the k8s clientset to query the API server for services in the LoadBalancerEmulator.
 		// We define the tunnel and minikube error free if the API server responds within a second.
 		// This also contributes to better UX, the tunnel status check can happen every second and
 		// doesn't hang on the API server call during startup and shutdown time or if there is a temporary error.
-		clientset, err := service.K8s.GetClientset(1 * time.Second)
+		clientset, err := kapi.Client(cname)
 		if err != nil {
-			exit.WithError("error creating clientset", err)
+			exit.Error(reason.InternalKubernetesClient, "error creating clientset", err)
 		}
 
 		ctrlC := make(chan os.Signal, 1)
@@ -78,10 +77,11 @@ var tunnelCmd = &cobra.Command{
 			cancel()
 		}()
 
-		if runtime.GOOS == "darwin" && co.Config.Driver == oci.Docker {
+		if driver.NeedsPortForward(co.Config.Driver) {
+
 			port, err := oci.ForwardedPort(oci.Docker, cname, 22)
 			if err != nil {
-				exit.WithError("error getting ssh port", err)
+				exit.Error(reason.DrvPortForward, "error getting ssh port", err)
 			}
 			sshPort := strconv.Itoa(port)
 			sshKey := filepath.Join(localpath.MiniPath(), "machines", cname, "id_rsa")
@@ -89,7 +89,7 @@ var tunnelCmd = &cobra.Command{
 			kicSSHTunnel := kic.NewSSHTunnel(ctx, sshPort, sshKey, clientset.CoreV1())
 			err = kicSSHTunnel.Start()
 			if err != nil {
-				exit.WithError("error starting tunnel", err)
+				exit.Error(reason.SvcTunnelStart, "error starting tunnel", err)
 			}
 
 			return
@@ -97,12 +97,12 @@ var tunnelCmd = &cobra.Command{
 
 		done, err := manager.StartTunnel(ctx, cname, co.API, config.DefaultLoader, clientset.CoreV1())
 		if err != nil {
-			exit.WithError("error starting tunnel", err)
+			exit.Error(reason.SvcTunnelStart, "error starting tunnel", err)
 		}
 		<-done
 	},
 }
 
 func init() {
-	tunnelCmd.Flags().BoolVarP(&cleanup, "cleanup", "c", false, "call with cleanup=true to remove old tunnels")
+	tunnelCmd.Flags().BoolVarP(&cleanup, "cleanup", "c", true, "call with cleanup=true to remove old tunnels")
 }

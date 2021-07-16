@@ -19,36 +19,38 @@ package out
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"testing"
 
+	"k8s.io/minikube/pkg/minikube/localpath"
+	"k8s.io/minikube/pkg/minikube/style"
 	"k8s.io/minikube/pkg/minikube/tests"
 	"k8s.io/minikube/pkg/minikube/translate"
 )
 
 func TestOutT(t *testing.T) {
 	// Set the system locale to Arabic and define a dummy translation file.
-	if err := translate.SetPreferredLanguage("ar"); err != nil {
-		t.Fatalf("SetPreferredLanguage: %v", err)
-	}
+	translate.SetPreferredLanguage("ar")
+
 	translate.Translations = map[string]interface{}{
 		"Installing Kubernetes version {{.version}} ...": "... {{.version}} تثبيت Kubernetes الإصدار",
 	}
 
-	var testCases = []struct {
-		style     StyleEnum
+	testCases := []struct {
+		style     style.Enum
 		message   string
 		params    V
 		want      string
 		wantASCII string
 	}{
-		{Happy, "Happy", nil, "😄  Happy\n", "* Happy\n"},
-		{Option, "Option", nil, "    ▪ Option\n", "  - Option\n"},
-		{Warning, "Warning", nil, "❗  Warning\n", "! Warning\n"},
-		{FatalType, "Fatal: {{.error}}", V{"error": "ugh"}, "💣  Fatal: ugh\n", "X Fatal: ugh\n"},
-		{Issue, "http://i/{{.number}}", V{"number": 10000}, "    ▪ http://i/10000\n", "  - http://i/10000\n"},
-		{Usage, "raw: {{.one}} {{.two}}", V{"one": "'%'", "two": "%d"}, "💡  raw: '%' %d\n", "* raw: '%' %d\n"},
-		{Running, "Installing Kubernetes version {{.version}} ...", V{"version": "v1.13"}, "🏃  ... v1.13 تثبيت Kubernetes الإصدار\n", "* ... v1.13 تثبيت Kubernetes الإصدار\n"},
+		{style.Happy, "Happy", nil, "😄  Happy\n", "* Happy\n"},
+		{style.Option, "Option", nil, "    ▪ Option\n", "  - Option\n"},
+		{style.Warning, "Warning", nil, "❗  Warning\n", "! Warning\n"},
+		{style.Fatal, "Fatal: {{.error}}", V{"error": "ugh"}, "💣  Fatal: ugh\n", "X Fatal: ugh\n"},
+		{style.Issue, "http://i/{{.number}}", V{"number": 10000}, "    ▪ http://i/10000\n", "  - http://i/10000\n"},
+		{style.Usage, "raw: {{.one}} {{.two}}", V{"one": "'%'", "two": "%d"}, "💡  raw: '%' %d\n", "* raw: '%' %d\n"},
+		{style.Running, "Installing Kubernetes version {{.version}} ...", V{"version": "v1.13"}, "🏃  ... v1.13 تثبيت Kubernetes الإصدار\n", "* ... v1.13 تثبيت Kubernetes الإصدار\n"},
 	}
 	for _, tc := range testCases {
 		for _, override := range []bool{true, false} {
@@ -57,7 +59,7 @@ func TestOutT(t *testing.T) {
 				os.Setenv(OverrideEnv, strconv.FormatBool(override))
 				f := tests.NewFakeFile()
 				SetOutFile(f)
-				T(tc.style, tc.message, tc.params)
+				Step(tc.style, tc.message, tc.params)
 				got := f.String()
 				want := tc.wantASCII
 				if override {
@@ -74,7 +76,7 @@ func TestOutT(t *testing.T) {
 func TestOut(t *testing.T) {
 	os.Setenv(OverrideEnv, "")
 
-	var testCases = []struct {
+	testCases := []struct {
 		format string
 		arg    interface{}
 		want   string
@@ -112,5 +114,51 @@ func TestErr(t *testing.T) {
 
 	if got != want {
 		t.Errorf("Err() = %q, want %q", got, want)
+	}
+}
+
+func createLogFile() (string, error) {
+	td := os.TempDir()
+	name := filepath.Join(td, "minikube_test_test_test.log")
+	f, err := os.Create(name)
+	if err != nil {
+		return "", fmt.Errorf("failed to create log file: %v", err)
+	}
+
+	return f.Name(), nil
+}
+
+func TestLatestLogPath(t *testing.T) {
+	filename, err := createLogFile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(filename)
+
+	testCases := []struct {
+		args []string
+		want string
+	}{
+		{
+			[]string{"minikube", "start"},
+			localpath.LastStartLog(),
+		},
+		{
+			[]string{"minikube", "status"},
+			filename,
+		},
+	}
+
+	for _, tt := range testCases {
+		oldArgs := os.Args
+		defer func() { os.Args = oldArgs }()
+		os.Args = tt.args
+		got, err := latestLogFilePath()
+		if err != nil {
+			t.Fatalf("os.Args = %s; latestLogFilePath() failed with error = %v", tt.args, err)
+		}
+		if got != tt.want {
+			t.Errorf("os.Args = %s; latestLogFilePath() = %q; wanted %q", tt.args, got, tt.want)
+		}
 	}
 }

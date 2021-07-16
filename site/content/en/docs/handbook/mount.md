@@ -14,13 +14,13 @@ aliases:
 
 To mount a directory from the host into the guest using the `mount` subcommand:
 
-```
+```shell
 minikube mount <source directory>:<target directory>
 ```
 
 For example, this would mount your home directory to appear as /host within the minikube VM:
 
-```
+```shell
 minikube mount $HOME:/host
 ```
 
@@ -34,23 +34,23 @@ This directory may then be referenced from a Kubernetes manifest, for example:
     "name": "ubuntu"
   },
   "spec": {
-        "containers": [
+    "containers": [
+      {
+        "name": "ubuntu",
+        "image": "ubuntu:18.04",
+        "args": ["bash"],
+        "stdin": true,
+        "stdinOnce": true,
+        "tty": true,
+        "workingDir": "/host",
+        "volumeMounts": [
           {
-            "name": "ubuntu",
-            "image": "ubuntu:18.04",
-            "args": [
-              "bash"
-            ],
-            "stdin": true,
-            "stdinOnce": true,
-            "tty": true,
-            "workingDir": "/host",
-            "volumeMounts": [{
-              "mountPath": "/host",
-              "name": "host-mount"
-            }]
+            "mountPath": "/host",
+            "name": "host-mount"
           }
-        ],
+        ]
+      }
+    ],
     "volumes": [
       {
         "name": "host-mount",
@@ -72,9 +72,9 @@ Some hypervisors, have built-in host folder sharing. Driver mounts are reliable 
 | VirtualBox | Linux | /home | /hosthome |
 | VirtualBox | macOS | /Users | /Users |
 | VirtualBox | Windows | C://Users | /c/Users |
-| VMware Fusion | macOS | /Users | /Users |
-| KVM | Linux | Unsupported | | 
-| HyperKit | Linux | Unsupported (see NFS mounts) | | 
+| VMware Fusion | macOS | /Users | /mnt/hgfs/Users |
+| KVM | Linux | Unsupported | |
+| HyperKit | Linux | Unsupported (see NFS mounts) | |
 
 These mounts can be disabled by passing `--disable-driver-mounts` to `minikube start`.
 

@@ -18,17 +18,23 @@ package cmd
 
 import (
 	"github.com/spf13/cobra"
+	"github.com/spf13/viper"
+	"k8s.io/minikube/pkg/minikube/cni"
 	"k8s.io/minikube/pkg/minikube/config"
 	"k8s.io/minikube/pkg/minikube/driver"
+	"k8s.io/minikube/pkg/minikube/exit"
 	"k8s.io/minikube/pkg/minikube/mustload"
 	"k8s.io/minikube/pkg/minikube/node"
 	"k8s.io/minikube/pkg/minikube/out"
+	"k8s.io/minikube/pkg/minikube/reason"
+	"k8s.io/minikube/pkg/minikube/style"
 )
 
 var (
 	cp     bool
 	worker bool
 )
+
 var nodeAddCmd = &cobra.Command{
 	Use:   "add",
 	Short: "Adds a node to the given cluster.",
@@ -43,7 +49,7 @@ var nodeAddCmd = &cobra.Command{
 
 		name := node.Name(len(cc.Nodes) + 1)
 
-		out.T(out.Happy, "Adding node {{.name}} to cluster {{.cluster}}", out.V{"name": name, "cluster": cc.Name})
+		out.Step(style.Happy, "Adding node {{.name}} to cluster {{.cluster}}", out.V{"name": name, "cluster": cc.Name})
 
 		// TODO: Deal with parameters better. Ideally we should be able to acceot any node-specific minikube start params here.
 		n := config.Node{
@@ -53,11 +59,29 @@ var nodeAddCmd = &cobra.Command{
 			KubernetesVersion: cc.KubernetesConfig.KubernetesVersion,
 		}
 
-		if err := node.Add(cc, n); err != nil {
-			maybeDeleteAndRetry(*cc, n, nil, err)
+		// Make sure to decrease the default amount of memory we use per VM if this is the first worker node
+		if len(cc.Nodes) == 1 {
+			if viper.GetString(memory) == "" {
+				cc.Memory = 2200
+			}
+
+			if !cc.MultiNodeRequested || cni.IsDisabled(*cc) {
+				warnAboutMultiNodeCNI()
+			}
 		}
 
-		out.T(out.Ready, "Successfully added {{.name}} to {{.cluster}}!", out.V{"name": name, "cluster": cc.Name})
+		if err := node.Add(cc, n, false); err != nil {
+			_, err := maybeDeleteAndRetry(cmd, *cc, n, nil, err)
+			if err != nil {
+				exit.Error(reason.GuestNodeAdd, "failed to add node", err)
+			}
+		}
+
+		if err := config.SaveProfile(cc.Name, cc); err != nil {
+			exit.Error(reason.HostSaveProfile, "failed to save config", err)
+		}
+
+		out.Step(style.Ready, "Successfully added {{.name}} to {{.cluster}}!", out.V{"name": name, "cluster": cc.Name})
 	},
 }
 

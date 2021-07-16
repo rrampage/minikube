@@ -20,15 +20,19 @@ import (
 	"fmt"
 	"io/ioutil"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"testing"
 
-	"github.com/blang/semver"
+	"github.com/blang/semver/v4"
 
-	"k8s.io/minikube/pkg/minikube/driver"
+	"k8s.io/minikube/pkg/minikube/driver/auxdriver"
+	"k8s.io/minikube/pkg/minikube/localpath"
+	"k8s.io/minikube/pkg/version"
 )
 
+// TestKVMDriverInstallOrUpdate makes sure our docker-machine-driver-kvm2 binary can be installed properly
 func TestKVMDriverInstallOrUpdate(t *testing.T) {
 	if NoneDriver() {
 		t.Skip("Skip none driver.")
@@ -38,6 +42,10 @@ func TestKVMDriverInstallOrUpdate(t *testing.T) {
 		t.Skip("Skip if not linux.")
 	}
 
+	if arm64Platform() {
+		t.Skip("Skip if arm64. See https://github.com/kubernetes/minikube/issues/10144")
+	}
+
 	MaybeParallel(t)
 
 	tests := []struct {
@@ -45,7 +53,7 @@ func TestKVMDriverInstallOrUpdate(t *testing.T) {
 		path string
 	}{
 		{name: "driver-without-version-support", path: filepath.Join(*testdataDir, "kvm2-driver-without-version")},
-		{name: "driver-with-older-version", path: filepath.Join(*testdataDir, "kvm2-driver-without-version")},
+		{name: "driver-with-older-version", path: filepath.Join(*testdataDir, "kvm2-driver-older-version")},
 	}
 
 	originalPath := os.Getenv("PATH")
@@ -56,7 +64,12 @@ func TestKVMDriverInstallOrUpdate(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Expected to create tempdir. test: %s, got: %v", tc.name, err)
 		}
-		defer os.RemoveAll(dir)
+		defer func() {
+			err := os.RemoveAll(dir)
+			if err != nil {
+				t.Errorf("Failed to remove dir %q: %v", dir, err)
+			}
+		}()
 
 		pwd, err := os.Getwd()
 		if err != nil {
@@ -84,7 +97,7 @@ func TestKVMDriverInstallOrUpdate(t *testing.T) {
 			t.Fatalf("Expected new semver. test: %v, got: %v", tc.name, err)
 		}
 
-		err = driver.InstallOrUpdate("kvm2", dir, newerVersion, true, true)
+		err = auxdriver.InstallOrUpdate("kvm2", dir, newerVersion, true, true)
 		if err != nil {
 			t.Fatalf("Failed to update driver to %v. test: %s, got: %v", newerVersion, tc.name, err)
 		}
@@ -96,6 +109,7 @@ func TestKVMDriverInstallOrUpdate(t *testing.T) {
 	}
 }
 
+// TestHyperKitDriverInstallOrUpdate makes sure our docker-machine-driver-hyperkit binary can be installed properly
 func TestHyperKitDriverInstallOrUpdate(t *testing.T) {
 	if runtime.GOOS != "darwin" {
 		t.Skip("Skip if not darwin.")
@@ -108,7 +122,7 @@ func TestHyperKitDriverInstallOrUpdate(t *testing.T) {
 		path string
 	}{
 		{name: "driver-without-version-support", path: filepath.Join(*testdataDir, "hyperkit-driver-without-version")},
-		{name: "driver-with-older-version", path: filepath.Join(*testdataDir, "hyperkit-driver-without-version")},
+		{name: "driver-with-older-version", path: filepath.Join(*testdataDir, "hyperkit-driver-older-version")},
 	}
 
 	originalPath := os.Getenv("PATH")
@@ -119,7 +133,12 @@ func TestHyperKitDriverInstallOrUpdate(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Expected to create tempdir. test: %s, got: %v", tc.name, err)
 		}
-		defer os.RemoveAll(dir)
+		defer func() {
+			err := os.RemoveAll(dir)
+			if err != nil {
+				t.Errorf("Failed to remove dir %q: %v", dir, err)
+			}
+		}()
 
 		pwd, err := os.Getwd()
 		if err != nil {
@@ -147,7 +166,11 @@ func TestHyperKitDriverInstallOrUpdate(t *testing.T) {
 			t.Fatalf("Expected new semver. test: %v, got: %v", tc.name, err)
 		}
 
-		err = driver.InstallOrUpdate("hyperkit", dir, newerVersion, true, true)
+		if sudoNeedsPassword() {
+			t.Skipf("password required to execute 'sudo', skipping remaining test")
+		}
+
+		err = auxdriver.InstallOrUpdate("hyperkit", dir, newerVersion, false, true)
 		if err != nil {
 			t.Fatalf("Failed to update driver to %v. test: %s, got: %v", newerVersion, tc.name, err)
 		}
@@ -157,4 +180,125 @@ func TestHyperKitDriverInstallOrUpdate(t *testing.T) {
 			t.Fatalf("Expected driver to be download. test: %s, got: %v", tc.name, err)
 		}
 	}
+}
+
+// TestHyperkitDriverSkipUpgrade makes sure our docker-machine-driver-hyperkit binary can be installed properly
+func TestHyperkitDriverSkipUpgrade(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("Skip if not darwin.")
+	}
+
+	MaybeParallel(t)
+	tests := []struct {
+		name            string
+		path            string
+		expectedVersion string
+	}{
+		{
+			name:            "upgrade-v1.11.0-to-current",
+			path:            filepath.Join(*testdataDir, "hyperkit-driver-version-1.11.0"),
+			expectedVersion: "v1.11.0",
+		},
+		{
+			name:            "upgrade-v1.2.0-to-current",
+			path:            filepath.Join(*testdataDir, "hyperkit-driver-older-version"),
+			expectedVersion: version.GetVersion(),
+		},
+	}
+
+	sudoPath, err := exec.LookPath("sudo")
+	if err != nil {
+		t.Fatalf("No sudo in path: %v", err)
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			mkDir, drvPath, err := prepareTempMinikubeDirWithHyperkitDriver(tc.name, tc.path)
+			if err != nil {
+				t.Fatalf("Failed to prepare tempdir. test: %s, got: %v", tc.name, err)
+			}
+			defer func() {
+				if err := os.RemoveAll(mkDir); err != nil {
+					t.Errorf("Failed to remove mkDir %q: %v", mkDir, err)
+				}
+			}()
+
+			cmd := exec.Command(Target(), "start", "--download-only", "--interactive=false", "--driver=hyperkit")
+			cmd.Stdout = os.Stdout
+			cmd.Stderr = os.Stdout
+			cmd.Env = append(os.Environ(),
+				fmt.Sprintf("PATH=%v%c%v", filepath.Dir(drvPath), filepath.ListSeparator, filepath.Dir(sudoPath)),
+				"MINIKUBE_HOME="+mkDir)
+			if err = cmd.Run(); err != nil {
+				t.Fatalf("failed to run minikube. got: %v", err)
+			}
+
+			upgradedVersion, err := driverVersion(drvPath)
+			if err != nil {
+				t.Fatalf("failed to check driver version. got: %v", err)
+			}
+
+			if upgradedVersion != tc.expectedVersion {
+				t.Fatalf("invalid driver version. expected: %v, got: %v", tc.expectedVersion, upgradedVersion)
+			}
+		})
+	}
+}
+
+func sudoNeedsPassword() bool {
+	err := exec.Command("sudo", "-n", "ls").Run()
+	return err != nil
+}
+
+func driverVersion(path string) (string, error) {
+	output, err := exec.Command(path, "version").Output()
+	if err != nil {
+		return "", err
+	}
+
+	var resultVersion string
+	_, err = fmt.Sscanf(string(output), "version: %s\n", &resultVersion)
+	if err != nil {
+		return "", err
+	}
+	return resultVersion, nil
+}
+
+// prepareTempMinikubeDirWithHyperkitDriver creates a temp .minikube directory
+// with structure essential to testing of hyperkit driver updates
+func prepareTempMinikubeDirWithHyperkitDriver(name, driver string) (string, string, error) {
+	temp, err := ioutil.TempDir("", name)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to create tempdir: %v", err)
+	}
+	mkDir := filepath.Join(temp, ".minikube")
+	mkBinDir := filepath.Join(mkDir, "bin")
+	err = os.MkdirAll(mkBinDir, 0777)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to prepare tempdir: %v", err)
+	}
+
+	pwd, err := os.Getwd()
+	if err != nil {
+		return "", "", fmt.Errorf("failed to get working directory: %v", err)
+	}
+
+	testDataDriverPath := filepath.Join(pwd, driver, "docker-machine-driver-hyperkit")
+	if _, err = os.Stat(testDataDriverPath); err != nil {
+		return "", "", fmt.Errorf("expected driver to exist: %v", err)
+	}
+	// copy driver to temp bin
+	testDriverPath := filepath.Join(mkBinDir, "docker-machine-driver-hyperkit")
+	if err = CopyFile(testDataDriverPath, testDriverPath, false); err != nil {
+		return "", "", fmt.Errorf("failed to setup current hyperkit driver: %v", err)
+	}
+
+	// try to copy cached files to the temp minikube folder to avoid downloading of iso and preloads
+	_ = CopyDir(filepath.Join(localpath.MakeMiniPath("cache")), filepath.Join(mkDir, "cache"))
+
+	// change permission to allow driver to be executable
+	if err = os.Chmod(testDriverPath, 0755); err != nil {
+		return "", "", fmt.Errorf("failed to set driver permission: %v", err)
+	}
+	return temp, testDriverPath, nil
 }

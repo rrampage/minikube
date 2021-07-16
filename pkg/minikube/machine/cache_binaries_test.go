@@ -20,11 +20,13 @@ import (
 	"fmt"
 	"io/ioutil"
 	"os"
+	"strings"
 	"testing"
 
 	"k8s.io/minikube/pkg/minikube/assets"
 	"k8s.io/minikube/pkg/minikube/bootstrapper"
 	"k8s.io/minikube/pkg/minikube/command"
+	"k8s.io/minikube/pkg/minikube/download"
 )
 
 type copyFailRunner struct {
@@ -82,6 +84,8 @@ func TestCopyBinary(t *testing.T) {
 }
 
 func TestCacheBinariesForBootstrapper(t *testing.T) {
+	download.DownloadMock = download.CreateDstDownloadMock
+
 	oldMinikubeHome := os.Getenv("MINIKUBE_HOME")
 	defer os.Setenv("MINIKUBE_HOME", oldMinikubeHome)
 
@@ -89,7 +93,13 @@ func TestCacheBinariesForBootstrapper(t *testing.T) {
 	if err != nil {
 		t.Fatalf("error during creating tmp dir: %v", err)
 	}
-	defer os.RemoveAll(minikubeHome)
+
+	defer func() { // clean up tempdir
+		err := os.RemoveAll(minikubeHome)
+		if err != nil {
+			t.Errorf("failed to clean up temp folder  %q", minikubeHome)
+		}
+	}()
 
 	var tc = []struct {
 		version, clusterBootstrapper string
@@ -112,7 +122,7 @@ func TestCacheBinariesForBootstrapper(t *testing.T) {
 	for _, test := range tc {
 		t.Run(test.version, func(t *testing.T) {
 			os.Setenv("MINIKUBE_HOME", test.minikubeHome)
-			err := CacheBinariesForBootstrapper(test.version, test.clusterBootstrapper)
+			err := CacheBinariesForBootstrapper(test.version, test.clusterBootstrapper, nil)
 			if err != nil && !test.err {
 				t.Fatalf("Got unexpected error %v", err)
 			}
@@ -120,5 +130,38 @@ func TestCacheBinariesForBootstrapper(t *testing.T) {
 				t.Fatalf("Expected error but got %v", err)
 			}
 		})
+	}
+}
+
+func TestExcludedBinariesNotDownloaded(t *testing.T) {
+	clusterBootstrapper := bootstrapper.Kubeadm
+	binaryList := bootstrapper.GetCachedBinaryList(clusterBootstrapper)
+	binaryToExclude := binaryList[0]
+
+	download.DownloadMock = func(src, dst string) error {
+		if strings.Contains(src, binaryToExclude) {
+			t.Errorf("Excluded binary was downloaded! Binary to exclude: %s", binaryToExclude)
+		}
+		return download.CreateDstDownloadMock(src, dst)
+	}
+
+	oldMinikubeHome := os.Getenv("MINIKUBE_HOME")
+	defer os.Setenv("MINIKUBE_HOME", oldMinikubeHome)
+
+	minikubeHome, err := ioutil.TempDir("/tmp", "")
+	if err != nil {
+		t.Fatalf("error during creating tmp dir: %v", err)
+	}
+	os.Setenv("MINIKUBE_HOME", minikubeHome)
+
+	defer func() { // clean up tempdir
+		err := os.RemoveAll(minikubeHome)
+		if err != nil {
+			t.Errorf("failed to clean up temp folder  %q", minikubeHome)
+		}
+	}()
+
+	if err := CacheBinariesForBootstrapper("v1.16.0", clusterBootstrapper, []string{binaryToExclude}); err != nil {
+		t.Errorf("Failed to cache binaries: %v", err)
 	}
 }

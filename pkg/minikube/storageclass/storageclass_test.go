@@ -17,6 +17,7 @@ limitations under the License.
 package storageclass
 
 import (
+	"context"
 	"fmt"
 	"io/ioutil"
 	"os"
@@ -74,7 +75,7 @@ func (mockStorageV1InterfaceWithBadItem) StorageClasses() storagev1.StorageClass
 	return mockStorageClassInterfaceWithBadItem{}
 }
 
-func (mockStorageClassInterfaceOk) Get(name string, options metav1.GetOptions) (*v1.StorageClass, error) {
+func (mockStorageClassInterfaceOk) Get(ctx context.Context, name string, options metav1.GetOptions) (*v1.StorageClass, error) {
 	if strings.HasPrefix(name, "bad-class") {
 		return nil, fmt.Errorf("mocked error. No such class")
 	}
@@ -82,31 +83,31 @@ func (mockStorageClassInterfaceOk) Get(name string, options metav1.GetOptions) (
 	return &sc, nil
 }
 
-func (m mockStorageClassInterfaceOk) List(opts metav1.ListOptions) (*v1.StorageClassList, error) {
+func (m mockStorageClassInterfaceOk) List(ctx context.Context, opts metav1.ListOptions) (*v1.StorageClassList, error) {
 	scl := v1.StorageClassList{}
 	sc := v1.StorageClass{Provisioner: "standard"}
 	scl.Items = append(scl.Items, sc)
 	return &scl, nil
 }
 
-func (m mockStorageClassInterfaceWithBadItem) List(opts metav1.ListOptions) (*v1.StorageClassList, error) {
+func (m mockStorageClassInterfaceWithBadItem) List(ctx context.Context, opts metav1.ListOptions) (*v1.StorageClassList, error) {
 	scl := v1.StorageClassList{}
 	sc := v1.StorageClass{Provisioner: "bad", ObjectMeta: metav1.ObjectMeta{Name: "standard"}}
 	scl.Items = append(scl.Items, sc)
 	return &scl, nil
 }
-func (mockStorageClassInterfaceListErr) List(opts metav1.ListOptions) (*v1.StorageClassList, error) {
+func (mockStorageClassInterfaceListErr) List(ctx context.Context, opts metav1.ListOptions) (*v1.StorageClassList, error) {
 	return nil, fmt.Errorf("mocked list error")
 }
 
-func (mockStorageClassInterfaceOk) Update(sc *v1.StorageClass) (*v1.StorageClass, error) {
+func (mockStorageClassInterfaceOk) Update(ctx context.Context, sc *v1.StorageClass, opts metav1.UpdateOptions) (*v1.StorageClass, error) {
 	if strings.HasPrefix(sc.Provisioner, "bad") {
 		return nil, fmt.Errorf("bad provisioner")
 	}
 	return &v1.StorageClass{}, nil
 }
 
-func (mockStorageClassInterfaceWithBadItem) Update(sc *v1.StorageClass) (*v1.StorageClass, error) {
+func (mockStorageClassInterfaceWithBadItem) Update(ctx context.Context, sc *v1.StorageClass, opts metav1.UpdateOptions) (*v1.StorageClass, error) {
 	if strings.HasPrefix(sc.Provisioner, "bad") {
 		return nil, fmt.Errorf("bad provisioner")
 	}
@@ -212,45 +213,6 @@ users:
 - name: minikube
 `
 
-func TestGetClient(t *testing.T) {
-	var tests = []struct {
-		description string
-		config      string
-		err         bool
-	}{
-		{
-			description: "ok",
-			config:      mockK8sConfig,
-		},
-		{
-			description: "no valid config",
-			config:      "this is not valid config",
-			err:         true,
-		},
-	}
-	configFile, err := ioutil.TempFile("/tmp", "")
-	if err != nil {
-		t.Fatalf(err.Error())
-	}
-	defer os.Remove(configFile.Name())
-	for _, test := range tests {
-		t.Run(test.description, func(t *testing.T) {
-
-			if err := setK8SConfig(test.config, configFile.Name()); err != nil {
-				t.Fatalf(err.Error())
-			}
-
-			_, err = getClient()
-			if err != nil && !test.err {
-				t.Fatalf("Unexpected err: %v for test: %v", err, test.description)
-			}
-			if err == nil && test.err {
-				t.Fatalf("Expected err for test: %v", test.description)
-			}
-		})
-	}
-}
-
 func TestGetStoragev1(t *testing.T) {
 	var tests = []struct {
 		description string
@@ -278,7 +240,8 @@ func TestGetStoragev1(t *testing.T) {
 				t.Fatalf(err.Error())
 			}
 
-			_, err = GetStoragev1()
+			// context name is hardcoded by mockK8sConfig
+			_, err = GetStoragev1("minikube")
 			if err != nil && !test.err {
 				t.Fatalf("Unexpected err: %v for test: %v", err, test.description)
 			}

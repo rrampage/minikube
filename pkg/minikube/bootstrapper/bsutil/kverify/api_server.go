@@ -14,12 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package kverify verifies a running kubernetes cluster is healthy
+// Package kverify verifies a running Kubernetes cluster is healthy
 package kverify
 
 import (
 	"crypto/tls"
+	"crypto/x509"
 	"fmt"
+	"io/ioutil"
 	"net"
 	"net/http"
 	"os/exec"
@@ -29,21 +31,23 @@ import (
 	"time"
 
 	"github.com/docker/machine/libmachine/state"
-	"github.com/golang/glog"
 	"github.com/pkg/errors"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apimachinery/pkg/version"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/klog/v2"
 	kconst "k8s.io/kubernetes/cmd/kubeadm/app/constants"
 	"k8s.io/minikube/pkg/minikube/bootstrapper"
 	"k8s.io/minikube/pkg/minikube/command"
 	"k8s.io/minikube/pkg/minikube/config"
 	"k8s.io/minikube/pkg/minikube/cruntime"
+	"k8s.io/minikube/pkg/minikube/localpath"
+	"k8s.io/minikube/pkg/util/retry"
 )
 
 // WaitForAPIServerProcess waits for api server to be healthy returns error if it doesn't
 func WaitForAPIServerProcess(r cruntime.Manager, bs bootstrapper.Bootstrapper, cfg config.ClusterConfig, cr command.Runner, start time.Time, timeout time.Duration) error {
-	glog.Infof("waiting for apiserver process to appear ...")
+	klog.Infof("waiting for apiserver process to appear ...")
 	err := wait.PollImmediate(time.Millisecond*500, timeout, func() (bool, error) {
 		if time.Since(start) > timeout {
 			return false, fmt.Errorf("cluster wait timed out during process check")
@@ -54,7 +58,7 @@ func WaitForAPIServerProcess(r cruntime.Manager, bs bootstrapper.Bootstrapper, c
 			time.Sleep(kconst.APICallRetryInterval * 5)
 		}
 
-		if _, ierr := apiServerPID(cr); ierr != nil {
+		if _, ierr := APIServerPID(cr); ierr != nil {
 			return false, nil
 		}
 
@@ -63,12 +67,12 @@ func WaitForAPIServerProcess(r cruntime.Manager, bs bootstrapper.Bootstrapper, c
 	if err != nil {
 		return fmt.Errorf("apiserver process never appeared")
 	}
-	glog.Infof("duration metric: took %s to wait for apiserver process to appear ...", time.Since(start))
+	klog.Infof("duration metric: took %s to wait for apiserver process to appear ...", time.Since(start))
 	return nil
 }
 
-// apiServerPID returns our best guess to the apiserver pid
-func apiServerPID(cr command.Runner) (int, error) {
+// APIServerPID returns our best guess to the apiserver pid
+func APIServerPID(cr command.Runner) (int, error) {
 	rr, err := cr.RunCmd(exec.Command("sudo", "pgrep", "-xnf", "kube-apiserver.*minikube.*"))
 	if err != nil {
 		return 0, err
@@ -79,7 +83,7 @@ func apiServerPID(cr command.Runner) (int, error) {
 
 // WaitForHealthyAPIServer waits for api server status to be running
 func WaitForHealthyAPIServer(r cruntime.Manager, bs bootstrapper.Bootstrapper, cfg config.ClusterConfig, cr command.Runner, client *kubernetes.Clientset, start time.Time, hostname string, port int, timeout time.Duration) error {
-	glog.Infof("waiting for apiserver healthz status ...")
+	klog.Infof("waiting for apiserver healthz status ...")
 	hStart := time.Now()
 
 	healthz := func() (bool, error) {
@@ -92,9 +96,9 @@ func WaitForHealthyAPIServer(r cruntime.Manager, bs bootstrapper.Bootstrapper, c
 			time.Sleep(kconst.APICallRetryInterval * 5)
 		}
 
-		status, err := apiServerHealthz(hostname, port)
+		status, err := apiServerHealthzNow(hostname, port)
 		if err != nil {
-			glog.Warningf("status: %v", err)
+			klog.Warningf("status: %v", err)
 			return false, nil
 		}
 		if status != state.Running {
@@ -104,7 +108,7 @@ func WaitForHealthyAPIServer(r cruntime.Manager, bs bootstrapper.Bootstrapper, c
 	}
 
 	if err := wait.PollImmediate(kconst.APICallRetryInterval, kconst.DefaultControlPlaneTimeout, healthz); err != nil {
-		return fmt.Errorf("apiserver healthz never reported healthy")
+		return fmt.Errorf("apiserver healthz never reported healthy: %v", err)
 	}
 
 	vcheck := func() (bool, error) {
@@ -112,7 +116,7 @@ func WaitForHealthyAPIServer(r cruntime.Manager, bs bootstrapper.Bootstrapper, c
 			return false, fmt.Errorf("cluster wait timed out during version check")
 		}
 		if err := APIServerVersionMatch(client, cfg.KubernetesConfig.KubernetesVersion); err != nil {
-			glog.Warningf("api server version match failed: %v", err)
+			klog.Warningf("api server version match failed: %v", err)
 			return false, nil
 		}
 		return true, nil
@@ -122,7 +126,7 @@ func WaitForHealthyAPIServer(r cruntime.Manager, bs bootstrapper.Bootstrapper, c
 		return fmt.Errorf("controlPlane never updated to %s", cfg.KubernetesConfig.KubernetesVersion)
 	}
 
-	glog.Infof("duration metric: took %s to wait for apiserver health ...", time.Since(hStart))
+	klog.Infof("duration metric: took %s to wait for apiserver health ...", time.Since(hStart))
 	return nil
 }
 
@@ -132,75 +136,138 @@ func APIServerVersionMatch(client *kubernetes.Clientset, expected string) error 
 	if err != nil {
 		return errors.Wrap(err, "server version")
 	}
-	glog.Infof("control plane version: %s", vi)
+	klog.Infof("control plane version: %s", vi)
 	if version.CompareKubeAwareVersionStrings(vi.String(), expected) != 0 {
 		return fmt.Errorf("controlPane = %q, expected: %q", vi.String(), expected)
 	}
 	return nil
 }
 
+// WaitForAPIServerStatus waits for 'to' duration to get apiserver pod running or stopped
+// this functions is intended to use in situations where apiserver process can be recreated
+// by container runtime restart for example and there is a gap before it comes back
+func WaitForAPIServerStatus(cr command.Runner, to time.Duration, hostname string, port int) (state.State, error) {
+	var st state.State
+	err := wait.PollImmediate(200*time.Millisecond, to, func() (bool, error) {
+		var err error
+		st, err = APIServerStatus(cr, hostname, port)
+		if st == state.Stopped {
+			return false, nil
+		}
+		return true, err
+	})
+	return st, err
+}
+
 // APIServerStatus returns apiserver status in libmachine style state.State
 func APIServerStatus(cr command.Runner, hostname string, port int) (state.State, error) {
-	glog.Infof("Checking apiserver status ...")
+	klog.Infof("Checking apiserver status ...")
 
-	pid, err := apiServerPID(cr)
+	pid, err := APIServerPID(cr)
 	if err != nil {
-		glog.Warningf("stopped: unable to get apiserver pid: %v", err)
+		klog.Warningf("stopped: unable to get apiserver pid: %v", err)
 		return state.Stopped, nil
 	}
 
 	// Get the freezer cgroup entry for this pid
 	rr, err := cr.RunCmd(exec.Command("sudo", "egrep", "^[0-9]+:freezer:", fmt.Sprintf("/proc/%d/cgroup", pid)))
 	if err != nil {
-		glog.Warningf("unable to find freezer cgroup: %v", err)
+		klog.Warningf("unable to find freezer cgroup: %v", err)
 		return apiServerHealthz(hostname, port)
 
 	}
 	freezer := strings.TrimSpace(rr.Stdout.String())
-	glog.Infof("apiserver freezer: %q", freezer)
+	klog.Infof("apiserver freezer: %q", freezer)
 	fparts := strings.Split(freezer, ":")
 	if len(fparts) != 3 {
-		glog.Warningf("unable to parse freezer - found %d parts: %s", len(fparts), freezer)
+		klog.Warningf("unable to parse freezer - found %d parts: %s", len(fparts), freezer)
 		return apiServerHealthz(hostname, port)
 	}
 
 	rr, err = cr.RunCmd(exec.Command("sudo", "cat", path.Join("/sys/fs/cgroup/freezer", fparts[2], "freezer.state")))
 	if err != nil {
-		glog.Errorf("unable to get freezer state: %s", rr.Stderr.String())
+		// example error from github action:
+		// cat: /sys/fs/cgroup/freezer/actions_job/e62ef4349cc5a70f4b49f8a150ace391da6ad6df27073c83ecc03dbf81fde1ce/kubepods/burstable/poda1de58db0ce81d19df7999f6808def1b/5df53230fe3483fd65f341923f18a477fda92ae9cd71061168130ef164fe479c/freezer.state: No such file or directory\n"*
+		// TODO: #7770 investigate how to handle this error better.
+		if strings.Contains(rr.Stderr.String(), "freezer.state: No such file or directory\n") {
+			klog.Infof("unable to get freezer state (might be okay and be related to #770): %s", rr.Stderr.String())
+		} else {
+			klog.Warningf("unable to get freezer state: %s", rr.Stderr.String())
+		}
+
 		return apiServerHealthz(hostname, port)
 	}
 
 	fs := strings.TrimSpace(rr.Stdout.String())
-	glog.Infof("freezer state: %q", fs)
+	klog.Infof("freezer state: %q", fs)
 	if fs == "FREEZING" || fs == "FROZEN" {
 		return state.Paused, nil
 	}
 	return apiServerHealthz(hostname, port)
 }
 
-// apiServerHealthz hits the /healthz endpoint and returns libmachine style state.State
+// apiServerHealthz checks apiserver in a patient and tolerant manner
 func apiServerHealthz(hostname string, port int) (state.State, error) {
-	url := fmt.Sprintf("https://%s/healthz", net.JoinHostPort(hostname, fmt.Sprint(port)))
-	glog.Infof("Checking apiserver healthz at %s ...", url)
-	// To avoid: x509: certificate signed by unknown authority
-	tr := &http.Transport{
-		Proxy:           nil, // To avoid connectiv issue if http(s)_proxy is set.
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	var st state.State
+	var err error
+
+	check := func() error {
+		// etcd gets upset sometimes and causes healthz to report a failure. Be tolerant of it.
+		st, err = apiServerHealthzNow(hostname, port)
+		if err != nil {
+			return err
+		}
+		if st != state.Running {
+			return fmt.Errorf("state is %q", st)
+		}
+		return nil
 	}
-	client := &http.Client{Transport: tr}
+
+	err = retry.Local(check, 15*time.Second)
+
+	// Don't propagate 'Stopped' upwards as an error message, as clients may interpret the err
+	// as an inability to get status. We need it for retry.Local, however.
+	if st == state.Stopped {
+		return st, nil
+	}
+	return st, err
+}
+
+// apiServerHealthzNow hits the /healthz endpoint and returns libmachine style state.State
+func apiServerHealthzNow(hostname string, port int) (state.State, error) {
+	url := fmt.Sprintf("https://%s/healthz", net.JoinHostPort(hostname, fmt.Sprint(port)))
+	klog.Infof("Checking apiserver healthz at %s ...", url)
+	cert, err := ioutil.ReadFile(localpath.CACert())
+	if err != nil {
+		klog.Infof("ca certificate: %v", err)
+		return state.Stopped, err
+	}
+	pool := x509.NewCertPool()
+	pool.AppendCertsFromPEM(cert)
+	tr := &http.Transport{
+		Proxy:           nil, // Avoid using a proxy to speak to a local host
+		TLSClientConfig: &tls.Config{RootCAs: pool},
+	}
+	client := &http.Client{Transport: tr, Timeout: 5 * time.Second}
 	resp, err := client.Get(url)
 	// Connection refused, usually.
 	if err != nil {
-		glog.Infof("stopped: %s: %v", url, err)
+		klog.Infof("stopped: %s: %v", url, err)
 		return state.Stopped, nil
 	}
+
+	defer resp.Body.Close()
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		klog.Warningf("unable to read response body: %s", err)
+	}
+
+	klog.Infof("%s returned %d:\n%s", url, resp.StatusCode, body)
 	if resp.StatusCode == http.StatusUnauthorized {
-		glog.Errorf("%s returned code %d (unauthorized). Please ensure that your apiserver authorization settings make sense!", url, resp.StatusCode)
-		return state.Error, nil
+		return state.Error, fmt.Errorf("%s returned code %d (unauthorized). Check your apiserver authorization settings:\n%s", url, resp.StatusCode, body)
 	}
 	if resp.StatusCode != http.StatusOK {
-		glog.Warningf("%s response: %v %+v", url, err, resp)
-		return state.Error, nil
+		return state.Error, fmt.Errorf("%s returned error %d:\n%s", url, resp.StatusCode, body)
 	}
 	return state.Running, nil
 }

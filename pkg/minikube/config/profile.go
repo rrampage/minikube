@@ -18,13 +18,15 @@ package config
 
 import (
 	"encoding/json"
+	"fmt"
 	"io/ioutil"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 
-	"github.com/golang/glog"
 	"github.com/spf13/viper"
+	"k8s.io/klog/v2"
 	"k8s.io/minikube/pkg/drivers/kic/oci"
 	"k8s.io/minikube/pkg/minikube/localpath"
 	"k8s.io/minikube/pkg/util/lock"
@@ -34,9 +36,6 @@ var keywords = []string{"start", "stop", "status", "delete", "config", "open", "
 
 // IsValid checks if the profile has the essential info needed for a profile
 func (p *Profile) IsValid() bool {
-	if p.Config == nil {
-		return false
-	}
 	if p.Config == nil {
 		return false
 	}
@@ -83,6 +82,16 @@ func PrimaryControlPlane(cc *ClusterConfig) (Node, error) {
 	return cp, nil
 }
 
+// ProfileNameValid checks if the profile name is container name and DNS hostname/label friendly.
+func ProfileNameValid(name string) bool {
+	// RestrictedNamePattern describes the characters allowed to represent a profile's name
+	const RestrictedNamePattern = `(([a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9\-]*[a-zA-Z0-9])\.)*([A-Za-z0-9]|[A-Za-z0-9][A-Za-z0-9\-]*[A-Za-z0-9])`
+
+	var validName = regexp.MustCompile(`^` + RestrictedNamePattern + `$`)
+	// length needs to be more than 1 character because docker volume #9366
+	return validName.MatchString(name) && len(name) > 1
+}
+
 // ProfileNameInReservedKeywords checks if the profile is an internal keywords
 func ProfileNameInReservedKeywords(name string) bool {
 	for _, v := range keywords {
@@ -125,6 +134,7 @@ func SaveNode(cfg *ClusterConfig, node *Node) error {
 	if !update {
 		cfg.Nodes = append(cfg.Nodes, *node)
 	}
+
 	return SaveProfile(viper.GetString(ProfileName), cfg)
 }
 
@@ -135,7 +145,7 @@ func SaveProfile(name string, cfg *ClusterConfig, miniHome ...string) error {
 		return err
 	}
 	path := profileFilePath(name, miniHome...)
-	glog.Infof("Saving config to %s ...", path)
+	klog.Infof("Saving config to %s ...", path)
 	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		return err
 	}
@@ -169,6 +179,7 @@ func SaveProfile(name string, cfg *ClusterConfig, miniHome ...string) error {
 	if err = os.Rename(tf.Name(), path); err != nil {
 		return err
 	}
+
 	return nil
 }
 
@@ -181,6 +192,11 @@ func DeleteProfile(profile string, miniHome ...string) error {
 	return os.RemoveAll(ProfileFolderPath(profile, miniPath))
 }
 
+// DockerContainers lists all containers created by docker driver
+var DockerContainers = func() ([]string, error) {
+	return oci.ListOwnedContainers(oci.Docker)
+}
+
 // ListProfiles returns all valid and invalid (if any) minikube profiles
 // invalidPs are the profiles that have a directory or config file but not usable
 // invalidPs would be suggested to be deleted
@@ -191,13 +207,14 @@ func ListProfiles(miniHome ...string) (validPs []*Profile, inValidPs []*Profile,
 	if err != nil {
 		return nil, nil, err
 	}
-	// try to get profiles list based on all contrainers created by docker driver
-	cs, err := oci.ListOwnedContainers(oci.Docker)
+	// try to get profiles list based on all containers created by docker driver
+	cs, err := DockerContainers()
 	if err == nil {
 		pDirs = append(pDirs, cs...)
 	}
-	pDirs = removeDupes(pDirs)
-	for _, n := range pDirs {
+
+	nodeNames := map[string]bool{}
+	for _, n := range removeDupes(pDirs) {
 		p, err := LoadProfile(n, miniHome...)
 		if err != nil {
 			inValidPs = append(inValidPs, p)
@@ -208,11 +225,35 @@ func ListProfiles(miniHome ...string) (validPs []*Profile, inValidPs []*Profile,
 			continue
 		}
 		validPs = append(validPs, p)
+
+		for _, child := range p.Config.Nodes {
+			nodeNames[MachineName(*p.Config, child)] = true
+		}
 	}
+
+	inValidPs = removeChildNodes(inValidPs, nodeNames)
 	return validPs, inValidPs, nil
 }
 
-// removeDupes removes duplicates
+// ListValidProfiles returns profiles in minikube home dir
+// Unlike `ListProfiles` this function doens't try to get profile from container
+func ListValidProfiles(miniHome ...string) (ps []*Profile, err error) {
+	// try to get profiles list based on left over evidences such as directory
+	pDirs, err := profileDirs(miniHome...)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, n := range pDirs {
+		p, err := LoadProfile(n, miniHome...)
+		if err == nil && p.IsValid() {
+			ps = append(ps, p)
+		}
+	}
+	return ps, nil
+}
+
+// removeDupes removes duplipcates
 func removeDupes(profiles []string) []string {
 	// Use map to record duplicates as we find them.
 	seen := map[string]bool{}
@@ -230,6 +271,18 @@ func removeDupes(profiles []string) []string {
 	}
 	// Return the new slice.
 	return result
+}
+
+// removeChildNodes remove invalid profiles which have a same name with any sub-node's machine name
+// it will return nil if invalid profiles are not exists.
+func removeChildNodes(inValidPs []*Profile, nodeNames map[string]bool) (ps []*Profile) {
+	for _, p := range inValidPs {
+		if _, ok := nodeNames[p.Name]; !ok {
+			ps = append(ps, p)
+		}
+	}
+
+	return ps
 }
 
 // LoadProfile loads type Profile based on its name
@@ -275,4 +328,13 @@ func ProfileFolderPath(profile string, miniHome ...string) string {
 		miniPath = miniHome[0]
 	}
 	return filepath.Join(miniPath, "profiles", profile)
+}
+
+// MachineName returns the name of the machine, as seen by the hypervisor given the cluster and node names
+func MachineName(cc ClusterConfig, n Node) string {
+	// For single node cluster, default to back to old naming
+	if (len(cc.Nodes) == 1 && cc.Nodes[0].Name == n.Name) || n.ControlPlane {
+		return cc.Name
+	}
+	return fmt.Sprintf("%s-%s", cc.Name, n.Name)
 }

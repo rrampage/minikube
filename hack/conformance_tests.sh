@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 
 # Copyright 2019 The Kubernetes Authors All rights reserved.
 #
@@ -27,28 +27,31 @@ set -ex -o pipefail
 readonly PROFILE_NAME="k8sconformance"
 readonly MINIKUBE=${1:-./out/minikube}
 shift || true
-readonly START_ARGS=$*
+readonly START_ARGS=${@:-}
 
 # Requires a fully running Kubernetes cluster.
 "${MINIKUBE}" delete -p "${PROFILE_NAME}" || true
-"${MINIKUBE}" start -p "${PROFILE_NAME}" $START_ARGS
+"${MINIKUBE}" start -p "${PROFILE_NAME}" ${START_ARGS} --wait=all --nodes=2
+kubectl --context "${PROFILE_NAME}" get pods --all-namespaces
 "${MINIKUBE}" status -p "${PROFILE_NAME}"
-kubectl get pods --all-namespaces
 
-go get -u -v github.com/heptio/sonobuoy
-sonobuoy run --wait
+curl -LO https://github.com/vmware-tanzu/sonobuoy/releases/download/v0.19.0/sonobuoy_0.19.0_linux_amd64.tar.gz || true
+tar -xzf sonobuoy_0.19.0_linux_amd64.tar.gz
+
+
+./sonobuoy run --mode=certified-conformance --wait --alsologtostderr
 outdir="$(mktemp -d)"
-sonobuoy retrieve "${outdir}"
+./sonobuoy retrieve "${outdir}"
 
 cwd=$(pwd)
 
 cd "${outdir}"
 mkdir ./results; tar xzf *.tar.gz -C ./results
 
-version=$(${MINIKUBE} version  | cut -d" " -f3)
+version=$(${cwd}/${MINIKUBE} version  | cut -d" " -f3)
 
-mkdir minikube-${version}
-cd minikube-${version}
+mkdir -p "minikube-${version}"
+cd "minikube-${version}"
 
 cat <<EOF >PRODUCT.yaml
 vendor: minikube
@@ -66,6 +69,6 @@ cat <<EOF >README.md
 ./hack/conformance_tests.sh $MINIKUBE $START_ARGS
 EOF
 
-cp ../results/plugins/e2e/results/* .
+cp -r ../results/plugins/e2e/results/global/* .
 cd ..
-cp -r minikube-${version} ${cwd}
+cp -r "minikube-${version}" "${cwd}"

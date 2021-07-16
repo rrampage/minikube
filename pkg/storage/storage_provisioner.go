@@ -17,20 +17,21 @@ limitations under the License.
 package storage
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path"
 
-	"github.com/golang/glog"
 	"github.com/pkg/errors"
+
 	core "k8s.io/api/core/v1"
 	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/uuid"
-	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
-	"sigs.k8s.io/sig-storage-lib-external-provisioner/controller"
+	"k8s.io/klog/v2"
+	"sigs.k8s.io/sig-storage-lib-external-provisioner/v6/controller"
 )
 
 const provisionerName = "k8s.io/minikube-hostpath"
@@ -55,16 +56,16 @@ func NewHostPathProvisioner(pvDir string) controller.Provisioner {
 var _ controller.Provisioner = &hostPathProvisioner{}
 
 // Provision creates a storage asset and returns a PV object representing it.
-func (p *hostPathProvisioner) Provision(options controller.ProvisionOptions) (*core.PersistentVolume, error) {
-	glog.Infof("Provisioning volume %v", options)
-	path := path.Join(p.pvDir, options.PVC.Name)
+func (p *hostPathProvisioner) Provision(ctx context.Context, options controller.ProvisionOptions) (*core.PersistentVolume, controller.ProvisioningState, error) {
+	path := path.Join(p.pvDir, options.PVC.Namespace, options.PVC.Name)
+	klog.Infof("Provisioning volume %v to %s", options, path)
 	if err := os.MkdirAll(path, 0777); err != nil {
-		return nil, err
+		return nil, controller.ProvisioningFinished, err
 	}
 
 	// Explicitly chmod created dir, so we know mode is set to 0777 regardless of umask
 	if err := os.Chmod(path, 0777); err != nil {
-		return nil, err
+		return nil, controller.ProvisioningFinished, err
 	}
 
 	pv := &core.PersistentVolume{
@@ -88,13 +89,13 @@ func (p *hostPathProvisioner) Provision(options controller.ProvisionOptions) (*c
 		},
 	}
 
-	return pv, nil
+	return pv, controller.ProvisioningFinished, nil
 }
 
 // Delete removes the storage asset that was created by Provision represented
 // by the given PV.
-func (p *hostPathProvisioner) Delete(volume *core.PersistentVolume) error {
-	glog.Infof("Deleting volume %v", volume)
+func (p *hostPathProvisioner) Delete(ctx context.Context, volume *core.PersistentVolume) error {
+	klog.Infof("Deleting volume %v", volume)
 	ann, ok := volume.Annotations["hostPathProvisionerIdentity"]
 	if !ok {
 		return errors.New("identity annotation not found on PV")
@@ -112,14 +113,14 @@ func (p *hostPathProvisioner) Delete(volume *core.PersistentVolume) error {
 
 // StartStorageProvisioner will start storage provisioner server
 func StartStorageProvisioner(pvDir string) error {
-	glog.Infof("Initializing the Minikube storage provisioner...")
+	klog.Infof("Initializing the minikube storage provisioner...")
 	config, err := rest.InClusterConfig()
 	if err != nil {
 		return err
 	}
 	clientset, err := kubernetes.NewForConfig(config)
 	if err != nil {
-		glog.Fatalf("Failed to create client: %v", err)
+		klog.Fatalf("Failed to create client: %v", err)
 	}
 
 	// The controller needs to know what the server version is because out-of-tree
@@ -137,7 +138,7 @@ func StartStorageProvisioner(pvDir string) error {
 	// PVs
 	pc := controller.NewProvisionController(clientset, provisionerName, hostPathProvisioner, serverVersion.GitVersion)
 
-	glog.Info("Storage provisioner initialized, now starting service!")
-	pc.Run(wait.NeverStop)
+	klog.Info("Storage provisioner initialized, now starting service!")
+	pc.Run(context.Background())
 	return nil
 }

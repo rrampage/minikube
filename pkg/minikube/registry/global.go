@@ -21,7 +21,8 @@ import (
 	"os"
 	"sort"
 
-	"github.com/golang/glog"
+	"k8s.io/klog/v2"
+	"k8s.io/minikube/pkg/minikube/translate"
 )
 
 const (
@@ -35,7 +36,7 @@ const (
 	None = "none"
 )
 
-// IsKIC checks if the driver is a kubernetes in container
+// IsKIC checks if the driver is a Kubernetes in container
 func IsKIC(name string) bool {
 	return name == Docker || name == Podman
 }
@@ -65,16 +66,26 @@ var (
 
 // DriverState is metadata relating to a driver and status
 type DriverState struct {
-	Name     string
+	// Name is the name of the driver used internally
+	Name string
+	// Default drivers are selected automatically
+	Default bool
+	// Preference is the original priority from driver
+	Preference Priority
+	// Priority is the effective priority with health
 	Priority Priority
-	State    State
+	// State is the state of driver and dependencies
+	State State
 	// Rejection is why we chose not to use this driver
 	Rejection string
+	// Suggestion is how the user could improve health
+	Suggestion string
 }
 
 func (d DriverState) String() string {
 	if d.Priority == Experimental {
-		return fmt.Sprintf("%s (experimental)", d.Name)
+		experimental := translate.T("experimental")
+		return fmt.Sprintf("%s (%s)", d.Name, experimental)
 	}
 	return d.Name
 }
@@ -97,16 +108,17 @@ func Driver(name string) DriverDef {
 // Available returns a list of available drivers in the global registry
 func Available(vm bool) []DriverState {
 	sts := []DriverState{}
-	glog.Infof("Querying for installed drivers using PATH=%s", os.Getenv("PATH"))
+	klog.Infof("Querying for installed drivers using PATH=%s", os.Getenv("PATH"))
 
 	for _, d := range globalRegistry.List() {
 		if d.Status == nil {
-			glog.Errorf("%q does not implement Status", d.Name)
+			klog.Errorf("%q does not implement Status", d.Name)
 			continue
 		}
 		s := d.Status()
-		glog.Infof("%s priority: %d, state: %+v", d.Name, d.Priority, s)
+		klog.Infof("%s default: %v priority: %d, state: %+v", d.Name, d.Default, d.Priority, s)
 
+		preference := d.Priority
 		priority := d.Priority
 		if !s.Healthy {
 			priority = Unhealthy
@@ -114,10 +126,10 @@ func Available(vm bool) []DriverState {
 
 		if vm {
 			if IsVM(d.Name) {
-				sts = append(sts, DriverState{Name: d.Name, Priority: priority, State: s})
+				sts = append(sts, DriverState{Name: d.Name, Default: d.Default, Preference: preference, Priority: priority, State: s})
 			}
 		} else {
-			sts = append(sts, DriverState{Name: d.Name, Priority: priority, State: s})
+			sts = append(sts, DriverState{Name: d.Name, Default: d.Default, Preference: preference, Priority: priority, State: s})
 		}
 	}
 

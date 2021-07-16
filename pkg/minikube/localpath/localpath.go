@@ -19,13 +19,15 @@ package localpath
 import (
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"runtime"
 	"strings"
 
-	"github.com/golang/glog"
+	"github.com/otiai10/copy"
 	"github.com/pkg/errors"
 	"k8s.io/client-go/util/homedir"
+	"k8s.io/klog/v2"
 )
 
 // MinikubeHome is the name of the minikube home directory environment variable.
@@ -60,14 +62,66 @@ func Profile(name string) string {
 	return filepath.Join(MiniPath(), "profiles", name)
 }
 
+// EventLog returns the path to a CloudEvents log
+// This log contains the transient state of minikube and the completed steps on start.
+func EventLog(name string) string {
+	return filepath.Join(Profile(name), "events.json")
+}
+
+// AuditLog returns the path to the audit log.
+// This log contains a history of commands run, by who, when, and what arguments.
+func AuditLog() string {
+	return filepath.Join(MiniPath(), "logs", "audit.json")
+}
+
+// LastStartLog returns the path to the last start log.
+func LastStartLog() string {
+	return filepath.Join(MiniPath(), "logs", "lastStart.txt")
+}
+
 // ClientCert returns client certificate path, used by kubeconfig
 func ClientCert(name string) string {
-	return filepath.Join(Profile(name), "client.crt")
+	new := filepath.Join(Profile(name), "client.crt")
+	if _, err := os.Stat(new); err == nil {
+		return new
+	}
+
+	// minikube v1.5.x
+	legacy := filepath.Join(MiniPath(), "client.crt")
+	if _, err := os.Stat(legacy); err == nil {
+		klog.Infof("copying %s -> %s", legacy, new)
+		if err := copy.Copy(legacy, new); err != nil {
+			klog.Errorf("failed copy %s -> %s: %v", legacy, new, err)
+			return legacy
+		}
+	}
+
+	return new
+}
+
+// PID returns the path to the pid file used by profile for scheduled stop
+func PID(profile string) string {
+	return path.Join(Profile(profile), "pid")
 }
 
 // ClientKey returns client certificate path, used by kubeconfig
 func ClientKey(name string) string {
-	return filepath.Join(Profile(name), "client.key")
+	new := filepath.Join(Profile(name), "client.key")
+	if _, err := os.Stat(new); err == nil {
+		return new
+	}
+
+	// minikube v1.5.x
+	legacy := filepath.Join(MiniPath(), "client.key")
+	if _, err := os.Stat(legacy); err == nil {
+		klog.Infof("copying %s -> %s", legacy, new)
+		if err := copy.Copy(legacy, new); err != nil {
+			klog.Errorf("failed copy %s -> %s: %v", legacy, new, err)
+			return legacy
+		}
+	}
+
+	return new
 }
 
 // CACert returns the minikube CA certificate shared between profiles
@@ -75,7 +129,7 @@ func CACert() string {
 	return filepath.Join(MiniPath(), "ca.crt")
 }
 
-// MachinePath returns the Minikube machine path of a machine
+// MachinePath returns the minikube machine path of a machine
 func MachinePath(machine string, miniHome ...string) string {
 	miniPath := MiniPath()
 	if len(miniHome) > 0 {
@@ -88,12 +142,12 @@ func MachinePath(machine string, miniHome ...string) string {
 func SanitizeCacheDir(image string) string {
 	if runtime.GOOS == "windows" && hasWindowsDriveLetter(image) {
 		// not sanitize Windows drive letter.
-		s := image[:2] + strings.Replace(image[2:], ":", "_", -1)
-		glog.Infof("windows sanitize: %s -> %s", image, s)
+		s := image[:2] + strings.ReplaceAll(image[2:], ":", "_")
+		klog.Infof("windows sanitize: %s -> %s", image, s)
 		return s
 	}
 	// ParseReference cannot have a : in the directory path
-	return strings.Replace(image, ":", "_", -1)
+	return strings.ReplaceAll(image, ":", "_")
 }
 
 func hasWindowsDriveLetter(s string) bool {
@@ -143,7 +197,7 @@ func getWindowsVolumeNameCmd(d string) (string, error) {
 		return "", err
 	}
 
-	outs := strings.Split(strings.Replace(string(stdout), "\r", "", -1), "\n")
+	outs := strings.Split(strings.ReplaceAll(string(stdout), "\r", ""), "\n")
 
 	var vname string
 	for _, l := range outs {

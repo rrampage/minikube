@@ -4,13 +4,14 @@
 #
 ################################################################################
 
-CRIO_BIN_VERSION = v1.17.1
-CRIO_BIN_COMMIT = ee2de87bd8e2a7a84799476cb4fc4ce8a78fdf6d
+CRIO_BIN_VERSION = v1.20.2
+CRIO_BIN_COMMIT = d5a999ad0a35d895ded554e1e18c142075501a98
 CRIO_BIN_SITE = https://github.com/cri-o/cri-o/archive
 CRIO_BIN_SOURCE = $(CRIO_BIN_VERSION).tar.gz
 CRIO_BIN_DEPENDENCIES = host-go libgpgme
 CRIO_BIN_GOPATH = $(@D)/_output
 CRIO_BIN_ENV = \
+	$(GO_TARGET_ENV) \
 	CGO_ENABLED=1 \
 	GO111MODULE=off \
 	GOPATH="$(CRIO_BIN_GOPATH)" \
@@ -32,7 +33,7 @@ endef
 
 define CRIO_BIN_BUILD_CMDS
 	mkdir -p $(@D)/bin
-	$(CRIO_BIN_ENV) $(MAKE) $(TARGET_CONFIGURE_OPTS) -C $(@D) GIT_COMMIT=$(CRIO_BIN_COMMIT) PREFIX=/usr binaries
+	$(CRIO_BIN_ENV) $(MAKE) $(TARGET_CONFIGURE_OPTS) -C $(@D) COMMIT_NO=$(CRIO_BIN_COMMIT) PREFIX=/usr binaries
 endef
 
 define CRIO_BIN_INSTALL_TARGET_CMDS

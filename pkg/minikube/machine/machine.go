@@ -19,10 +19,12 @@ package machine
 import (
 	"time"
 
+	"github.com/docker/machine/libmachine"
 	"github.com/docker/machine/libmachine/host"
 	libprovision "github.com/docker/machine/libmachine/provision"
-	"github.com/golang/glog"
 	"github.com/pkg/errors"
+	"k8s.io/klog/v2"
+	"k8s.io/minikube/pkg/minikube/config"
 	"k8s.io/minikube/pkg/minikube/driver"
 	"k8s.io/minikube/pkg/provision"
 )
@@ -83,10 +85,10 @@ func LoadMachine(name string) (*Machine, error) {
 
 // provisionDockerMachine provides fast provisioning of a docker machine
 func provisionDockerMachine(h *host.Host) error {
-	glog.Infof("provisioning docker machine ...")
+	klog.Infof("provisioning docker machine ...")
 	start := time.Now()
 	defer func() {
-		glog.Infof("provisioned docker machine in %s", time.Since(start))
+		klog.Infof("provisioned docker machine in %s", time.Since(start))
 	}()
 
 	p, err := fastDetectProvisioner(h)
@@ -102,9 +104,24 @@ func fastDetectProvisioner(h *host.Host) (libprovision.Provisioner, error) {
 	switch {
 	case driver.IsKIC(d):
 		return provision.NewUbuntuProvisioner(h.Driver), nil
-	case driver.BareMetal(d):
+	case driver.BareMetal(d), driver.IsSSH(d):
 		return libprovision.DetectProvisioner(h.Driver)
 	default:
 		return provision.NewBuildrootProvisioner(h.Driver), nil
 	}
+}
+
+// saveHost is a wrapper around libmachine's Save function to proactively update the node's IP whenever a host is saved
+func saveHost(api libmachine.API, h *host.Host, cfg *config.ClusterConfig, n *config.Node) error {
+	if err := api.Save(h); err != nil {
+		return errors.Wrap(err, "save")
+	}
+
+	// Save IP to config file for subsequent use
+	ip, err := h.Driver.GetIP()
+	if err != nil {
+		return err
+	}
+	n.IP = ip
+	return config.SaveNode(cfg, n)
 }

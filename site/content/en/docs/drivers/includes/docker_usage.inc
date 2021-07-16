@@ -1,6 +1,7 @@
-## Install Docker
+## Requirements
 
-- [Docker Desktop](https://hub.docker.com/search?q=&type=edition&offering=community&sort=updated_at&order=desc)
+- [Install Docker](https://hub.docker.com/search?q=&type=edition&offering=community&sort=updated_at&order=desc) 18.09 or higher
+- amd64 or arm64 system.
 
 ## Usage
 
@@ -14,3 +15,4 @@ To make docker the default driver:
 ```shell
 minikube config set driver docker
 ```
+

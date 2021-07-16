@@ -3,6 +3,8 @@ linkTitle: "Documentation"
 title: "Contributing to minikube documentation"
 date: 2019-07-31
 weight: 2
+aliases:
+  - /docs/contribution-guidelines/
 ---
 
 minikube's documentation is in [Markdown](https://www.markdownguide.org/cheat-sheet/), and generated using the following tools:
@@ -12,11 +14,17 @@ minikube's documentation is in [Markdown](https://www.markdownguide.org/cheat-sh
 
 In production, the minikube website is served using [Netlify](https://netlify.com/)
 
+## Small or cosmetic contributions
+
+Use Github's repositories and markdown editor as described by [Kubernetes's general guideline for documentation contributing](https://kubernetes.io/docs/contribute/start/#submit-a-pull-request)
+
 ## Local documentation website
 
 To serve documentation pages locally, clone the `minikube` repository and run:
 
-`make site`
+```shell
+make site
+```
 
 Notes :
 
@@ -27,7 +35,9 @@ Notes :
 
 We recommend installing [markdownlint](https://github.com/markdownlint/markdownlint) to find issues with your markdown file. Once installed, you can use this handy target:
 
-`make mdlint`
+```shell
+make mdlint
+```
 
 ## Style Guidelines
 
@@ -36,7 +46,6 @@ We follow the [Kubernetes Documentation Style Guide](https://kubernetes.io/docs/
 ## Linking between documents
 
 For compile-time checking of links, use one of the following forms to link between documentation pages:
-
 
 ```go-html-template
 {{</* ref "document.md" */>}}

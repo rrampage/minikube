@@ -56,6 +56,11 @@ controlPlaneEndpoint: {{.ControlPlaneAddress}}:{{.APIServerPort}}
 etcd:
   local:
     dataDir: {{.EtcdDataDir}}
+controllerManagerExtraArgs:
+  allocate-node-cidrs: "true"
+  leader-elect: "false"
+schedulerExtraArgs:
+  leader-elect: "false"
 kubernetesVersion: {{.KubernetesVersion}}
 networking:
   dnsDomain: {{if .DNSDomain}}{{.DNSDomain}}{{else}}cluster.local{{end}}
@@ -64,10 +69,14 @@ networking:
 ---
 apiVersion: kubelet.config.k8s.io/v1beta1
 kind: KubeletConfiguration
+cgroupDriver: {{.CgroupDriver}}
+clusterDomain: "{{if .DNSDomain}}{{.DNSDomain}}{{else}}cluster.local{{end}}"
 # disable disk resource management by default
 imageGCHighThresholdPercent: 100
 evictionHard:
   nodefs.available: "0%"
   nodefs.inodesFree: "0%"
   imagefs.available: "0%"
+failSwapOn: false
+staticPodPath: {{.StaticPodPath}}
 `))

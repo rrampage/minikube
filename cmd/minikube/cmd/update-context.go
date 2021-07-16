@@ -22,27 +22,35 @@ import (
 	"k8s.io/minikube/pkg/minikube/kubeconfig"
 	"k8s.io/minikube/pkg/minikube/mustload"
 	"k8s.io/minikube/pkg/minikube/out"
+	"k8s.io/minikube/pkg/minikube/reason"
+	"k8s.io/minikube/pkg/minikube/style"
 )
 
 // updateContextCmd represents the update-context command
 var updateContextCmd = &cobra.Command{
 	Use:   "update-context",
-	Short: "Verify the IP address of the running cluster in kubeconfig.",
+	Short: "Update kubeconfig in case of an IP or port change",
 	Long: `Retrieves the IP address of the running cluster, checks it
 			with IP in kubeconfig, and corrects kubeconfig if incorrect.`,
 	Run: func(cmd *cobra.Command, args []string) {
 		cname := ClusterFlagValue()
 		co := mustload.Running(cname)
+		//	cluster extension metada for kubeconfig
 
-		updated, err := kubeconfig.UpdateEndpoint(cname, co.CP.Hostname, co.CP.Port, kubeconfig.PathFromEnv())
+		updated, err := kubeconfig.UpdateEndpoint(cname, co.CP.Hostname, co.CP.Port, kubeconfig.PathFromEnv(), kubeconfig.NewExtension())
 		if err != nil {
-			exit.WithError("update config", err)
+			exit.Error(reason.HostKubeconfigUpdate, "update config", err)
 		}
 		if updated {
-			out.T(out.Celebrate, `"{{.context}}" context has been updated to point to {{.hostname}}:{{.port}}`, out.V{"context": cname, "hostname": co.CP.Hostname, "port": co.CP.Port})
+			out.Step(style.Celebrate, `"{{.context}}" context has been updated to point to {{.hostname}}:{{.port}}`, out.V{"context": cname, "hostname": co.CP.Hostname, "port": co.CP.Port})
 		} else {
-			out.T(out.Meh, `No changes required for the "{{.context}}" context`, out.V{"context": cname})
+			out.Styled(style.Meh, `No changes required for the "{{.context}}" context`, out.V{"context": cname})
 		}
 
+		if err := kubeconfig.SetCurrentContext(cname, kubeconfig.PathFromEnv()); err != nil {
+			out.ErrT(style.Sad, `Error while setting kubectl current context:  {{.error}}`, out.V{"error": err})
+		} else {
+			out.Styled(style.Kubectl, `Current context is "{{.context}}"`, out.V{"context": cname})
+		}
 	},
 }

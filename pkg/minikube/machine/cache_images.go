@@ -21,22 +21,22 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/docker/docker/client"
 	"github.com/docker/machine/libmachine/state"
-	"github.com/golang/glog"
 	"github.com/pkg/errors"
 	"golang.org/x/sync/errgroup"
+	"k8s.io/klog/v2"
 	"k8s.io/minikube/pkg/minikube/assets"
 	"k8s.io/minikube/pkg/minikube/bootstrapper"
 	"k8s.io/minikube/pkg/minikube/command"
 	"k8s.io/minikube/pkg/minikube/config"
 	"k8s.io/minikube/pkg/minikube/constants"
 	"k8s.io/minikube/pkg/minikube/cruntime"
-	"k8s.io/minikube/pkg/minikube/driver"
 	"k8s.io/minikube/pkg/minikube/image"
 	"k8s.io/minikube/pkg/minikube/localpath"
 	"k8s.io/minikube/pkg/minikube/vmpath"
@@ -55,39 +55,41 @@ func CacheImagesForBootstrapper(imageRepository string, version string, clusterB
 		return errors.Wrap(err, "cached images list")
 	}
 
-	if err := image.SaveToDir(images, constants.ImageCacheDir); err != nil {
+	if err := image.SaveToDir(images, constants.ImageCacheDir, false); err != nil {
 		return errors.Wrapf(err, "Caching images for %s", clusterBootstrapper)
 	}
 
 	return nil
 }
 
-// LoadImages loads previously cached images into the container runtime
-func LoadImages(cc *config.ClusterConfig, runner command.Runner, images []string, cacheDir string) error {
-	// Skip loading images if images already exist
-	if cruntime.DockerImagesPreloaded(runner, images) {
-		glog.Infof("Images are preloaded, skipping loading")
-		return nil
-	}
-
-	glog.Infof("LoadImages start: %s", images)
-	start := time.Now()
-
-	defer func() {
-		glog.Infof("LoadImages completed in %s", time.Since(start))
-	}()
-
-	var g errgroup.Group
-
+// LoadCachedImages loads previously cached images into the container runtime
+func LoadCachedImages(cc *config.ClusterConfig, runner command.Runner, images []string, cacheDir string, overwrite bool) error {
 	cr, err := cruntime.New(cruntime.Config{Type: cc.KubernetesConfig.ContainerRuntime, Runner: runner})
 	if err != nil {
 		return errors.Wrap(err, "runtime")
 	}
 
-	imgClient, err := client.NewClientWithOpts(client.FromEnv) // image client
-	if err != nil {
-		glog.Infof("couldn't get a local image daemon which might be ok: %v", err)
-		imgClient = nil
+	// Skip loading images if images already exist
+	if !overwrite && cr.ImagesPreloaded(images) {
+		klog.Infof("Images are preloaded, skipping loading")
+		return nil
+	}
+
+	klog.Infof("LoadImages start: %s", images)
+	start := time.Now()
+
+	defer func() {
+		klog.Infof("LoadImages completed in %s", time.Since(start))
+	}()
+
+	var g errgroup.Group
+
+	var imgClient *client.Client
+	if cr.Name() == "Docker" {
+		imgClient, err = client.NewClientWithOpts(client.FromEnv) // image client
+		if err != nil {
+			klog.Infof("couldn't get a local image daemon which might be ok: %v", err)
+		}
 	}
 
 	for _, image := range images {
@@ -101,14 +103,14 @@ func LoadImages(cc *config.ClusterConfig, runner command.Runner, images []string
 			if err == nil {
 				return nil
 			}
-			glog.Infof("%q needs transfer: %v", image, err)
-			return transferAndLoadImage(runner, cc.KubernetesConfig, image, cacheDir)
+			klog.Infof("%q needs transfer: %v", image, err)
+			return transferAndLoadCachedImage(runner, cc.KubernetesConfig, image, cacheDir)
 		})
 	}
 	if err := g.Wait(); err != nil {
 		return errors.Wrap(err, "loading cached images")
 	}
-	glog.Infoln("Successfully loaded all cached images")
+	klog.Infoln("Successfully loaded all cached images")
 	return nil
 }
 
@@ -157,22 +159,43 @@ func needsTransfer(imgClient *client.Client, imgName string, cr cruntime.Manager
 	return nil
 }
 
+// LoadLocalImages loads images into the container runtime
+func LoadLocalImages(cc *config.ClusterConfig, runner command.Runner, images []string) error {
+	var g errgroup.Group
+	for _, image := range images {
+		image := image
+		g.Go(func() error {
+			return transferAndLoadImage(runner, cc.KubernetesConfig, image, image)
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return errors.Wrap(err, "loading images")
+	}
+	klog.Infoln("Successfully loaded all images")
+	return nil
+}
+
 // CacheAndLoadImages caches and loads images to all profiles
-func CacheAndLoadImages(images []string) error {
+func CacheAndLoadImages(images []string, profiles []*config.Profile, overwrite bool) error {
+	if len(images) == 0 {
+		return nil
+	}
+
 	// This is the most important thing
-	if err := image.SaveToDir(images, constants.ImageCacheDir); err != nil {
+	if err := image.SaveToDir(images, constants.ImageCacheDir, overwrite); err != nil {
 		return errors.Wrap(err, "save to dir")
 	}
 
+	return DoLoadImages(images, profiles, constants.ImageCacheDir, overwrite)
+}
+
+// DoLoadImages loads images to all profiles
+func DoLoadImages(images []string, profiles []*config.Profile, cacheDir string, overwrite bool) error {
 	api, err := NewAPIClient()
 	if err != nil {
 		return errors.Wrap(err, "api")
 	}
 	defer api.Close()
-	profiles, _, err := config.ListProfiles() // need to load image to all profiles
-	if err != nil {
-		return errors.Wrap(err, "list profiles")
-	}
 
 	succeeded := []string{}
 	failed := []string{}
@@ -183,66 +206,93 @@ func CacheAndLoadImages(images []string) error {
 		c, err := config.Load(pName)
 		if err != nil {
 			// Non-fatal because it may race with profile deletion
-			glog.Errorf("Failed to load profile %q: %v", pName, err)
+			klog.Errorf("Failed to load profile %q: %v", pName, err)
 			failed = append(failed, pName)
 			continue
 		}
 
 		for _, n := range c.Nodes {
-			m := driver.MachineName(*c, n)
+			m := config.MachineName(*c, n)
 
 			status, err := Status(api, m)
 			if err != nil {
-				glog.Errorf("error getting status for %s: %v", pName, err)
-				failed = append(failed, pName)
+				klog.Warningf("error getting status for %s: %v", m, err)
+				failed = append(failed, m)
 				continue
 			}
 
 			if status == state.Running.String() { // the not running hosts will load on next start
 				h, err := api.Load(m)
 				if err != nil {
-					glog.Errorf("Failed to load machine %q: %v", m, err)
-					failed = append(failed, pName)
+					klog.Warningf("Failed to load machine %q: %v", m, err)
+					failed = append(failed, m)
 					continue
 				}
 				cr, err := CommandRunner(h)
 				if err != nil {
 					return err
 				}
-				err = LoadImages(c, cr, images, constants.ImageCacheDir)
-				if err != nil {
-					failed = append(failed, pName)
-					glog.Warningf("Failed to load cached images for profile %s. make sure the profile is running. %v", pName, err)
+				if cacheDir != "" {
+					// loading image names, from cache
+					err = LoadCachedImages(c, cr, images, cacheDir, overwrite)
+				} else {
+					// loading image files
+					err = LoadLocalImages(c, cr, images)
 				}
-				succeeded = append(succeeded, pName)
+				if err != nil {
+					failed = append(failed, m)
+					klog.Warningf("Failed to load cached images for profile %s. make sure the profile is running. %v", pName, err)
+					continue
+				}
+				succeeded = append(succeeded, m)
 			}
 		}
 	}
 
-	glog.Infof("succeeded pushing to: %s", strings.Join(succeeded, " "))
-	glog.Infof("failed pushing to: %s", strings.Join(failed, " "))
+	klog.Infof("succeeded pushing to: %s", strings.Join(succeeded, " "))
+	klog.Infof("failed pushing to: %s", strings.Join(failed, " "))
 	// Live pushes are not considered a failure
 	return nil
 }
 
-// transferAndLoadImage transfers and loads a single image from the cache
-func transferAndLoadImage(cr command.Runner, k8s config.KubernetesConfig, imgName string, cacheDir string) error {
+// transferAndLoadCachedImage transfers and loads a single image from the cache
+func transferAndLoadCachedImage(cr command.Runner, k8s config.KubernetesConfig, imgName string, cacheDir string) error {
+	src := filepath.Join(cacheDir, imgName)
+	src = localpath.SanitizeCacheDir(src)
+	return transferAndLoadImage(cr, k8s, src, imgName)
+}
+
+// transferAndLoadImage transfers and loads a single image
+func transferAndLoadImage(cr command.Runner, k8s config.KubernetesConfig, src string, imgName string) error {
 	r, err := cruntime.New(cruntime.Config{Type: k8s.ContainerRuntime, Runner: cr})
 	if err != nil {
 		return errors.Wrap(err, "runtime")
 	}
-	src := filepath.Join(cacheDir, imgName)
-	src = localpath.SanitizeCacheDir(src)
-	glog.Infof("Loading image from cache: %s", src)
+
+	if err := r.RemoveImage(imgName); err != nil {
+		errStr := strings.ToLower(err.Error())
+		if !strings.Contains(errStr, "no such image") {
+			return errors.Wrap(err, "removing image")
+		}
+	}
+
+	klog.Infof("Loading image from: %s", src)
 	filename := filepath.Base(src)
 	if _, err := os.Stat(src); err != nil {
 		return err
 	}
+
 	dst := path.Join(loadRoot, filename)
 	f, err := assets.NewFileAsset(src, loadRoot, filename, "0644")
 	if err != nil {
 		return errors.Wrapf(err, "creating copyable file asset: %s", filename)
 	}
+	defer func() {
+		if err := f.Close(); err != nil {
+			klog.Warningf("error closing the file %s: %v", f.GetSourcePath(), err)
+		}
+	}()
+
 	if err := cr.Copy(f); err != nil {
 		return errors.Wrap(err, "transferring cached image")
 	}
@@ -255,6 +305,220 @@ func transferAndLoadImage(cr command.Runner, k8s config.KubernetesConfig, imgNam
 		return errors.Wrapf(err, "%s load %s", r.Name(), dst)
 	}
 
-	glog.Infof("Transferred and loaded %s from cache", src)
+	klog.Infof("Transferred and loaded %s from cache", src)
+	return nil
+}
+
+// pullImages pulls images to the container run time
+func pullImages(cruntime cruntime.Manager, images []string) error {
+	klog.Infof("PullImages start: %s", images)
+	start := time.Now()
+
+	defer func() {
+		klog.Infof("PullImages completed in %s", time.Since(start))
+	}()
+
+	var g errgroup.Group
+
+	for _, image := range images {
+		image := image
+		g.Go(func() error {
+			return cruntime.PullImage(image)
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return errors.Wrap(err, "error pulling images")
+	}
+	klog.Infoln("Successfully pulled images")
+	return nil
+}
+
+// PullImages pulls images to all nodes in profile
+func PullImages(images []string, profile *config.Profile) error {
+	api, err := NewAPIClient()
+	if err != nil {
+		return errors.Wrap(err, "error creating api client")
+	}
+	defer api.Close()
+
+	succeeded := []string{}
+	failed := []string{}
+
+	pName := profile.Name
+
+	c, err := config.Load(pName)
+	if err != nil {
+		klog.Errorf("Failed to load profile %q: %v", pName, err)
+		return errors.Wrapf(err, "error loading config for profile :%v", pName)
+	}
+
+	for _, n := range c.Nodes {
+		m := config.MachineName(*c, n)
+
+		status, err := Status(api, m)
+		if err != nil {
+			klog.Warningf("error getting status for %s: %v", m, err)
+			continue
+		}
+
+		if status == state.Running.String() {
+			h, err := api.Load(m)
+			if err != nil {
+				klog.Warningf("Failed to load machine %q: %v", m, err)
+				continue
+			}
+			runner, err := CommandRunner(h)
+			if err != nil {
+				return err
+			}
+			cruntime, err := cruntime.New(cruntime.Config{Type: c.KubernetesConfig.ContainerRuntime, Runner: runner})
+			if err != nil {
+				return errors.Wrap(err, "error creating container runtime")
+			}
+			err = pullImages(cruntime, images)
+			if err != nil {
+				failed = append(failed, m)
+				klog.Warningf("Failed to pull images for profile %s %v", pName, err.Error())
+				continue
+			}
+			succeeded = append(succeeded, m)
+		}
+	}
+
+	klog.Infof("succeeded pulling to: %s", strings.Join(succeeded, " "))
+	klog.Infof("failed pulling to: %s", strings.Join(failed, " "))
+	return nil
+}
+
+// removeImages removes images from the container run time
+func removeImages(cruntime cruntime.Manager, images []string) error {
+	klog.Infof("RemovingImages start: %s", images)
+	start := time.Now()
+
+	defer func() {
+		klog.Infof("RemovingImages completed in %s", time.Since(start))
+	}()
+
+	var g errgroup.Group
+
+	for _, image := range images {
+		image := image
+		g.Go(func() error {
+			return cruntime.RemoveImage(image)
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return errors.Wrap(err, "error removing images")
+	}
+	klog.Infoln("Successfully removed images")
+	return nil
+}
+
+// RemoveImages removes images from all nodes in profile
+func RemoveImages(images []string, profile *config.Profile) error {
+	api, err := NewAPIClient()
+	if err != nil {
+		return errors.Wrap(err, "error creating api client")
+	}
+	defer api.Close()
+
+	succeeded := []string{}
+	failed := []string{}
+
+	pName := profile.Name
+
+	c, err := config.Load(pName)
+	if err != nil {
+		klog.Errorf("Failed to load profile %q: %v", pName, err)
+		return errors.Wrapf(err, "error loading config for profile :%v", pName)
+	}
+
+	for _, n := range c.Nodes {
+		m := config.MachineName(*c, n)
+
+		status, err := Status(api, m)
+		if err != nil {
+			klog.Warningf("error getting status for %s: %v", m, err)
+			continue
+		}
+
+		if status == state.Running.String() {
+			h, err := api.Load(m)
+			if err != nil {
+				klog.Warningf("Failed to load machine %q: %v", m, err)
+				continue
+			}
+			runner, err := CommandRunner(h)
+			if err != nil {
+				return err
+			}
+			cruntime, err := cruntime.New(cruntime.Config{Type: c.KubernetesConfig.ContainerRuntime, Runner: runner})
+			if err != nil {
+				return errors.Wrap(err, "error creating container runtime")
+			}
+			err = removeImages(cruntime, images)
+			if err != nil {
+				failed = append(failed, m)
+				klog.Warningf("Failed to remove images for profile %s %v", pName, err.Error())
+				continue
+			}
+			succeeded = append(succeeded, m)
+		}
+	}
+
+	klog.Infof("succeeded removing from: %s", strings.Join(succeeded, " "))
+	klog.Infof("failed removing from: %s", strings.Join(failed, " "))
+	return nil
+}
+
+// ListImages lists images on all nodes in profile
+func ListImages(profile *config.Profile) error {
+	api, err := NewAPIClient()
+	if err != nil {
+		return errors.Wrap(err, "error creating api client")
+	}
+	defer api.Close()
+
+	pName := profile.Name
+
+	c, err := config.Load(pName)
+	if err != nil {
+		klog.Errorf("Failed to load profile %q: %v", pName, err)
+		return errors.Wrapf(err, "error loading config for profile :%v", pName)
+	}
+
+	for _, n := range c.Nodes {
+		m := config.MachineName(*c, n)
+
+		status, err := Status(api, m)
+		if err != nil {
+			klog.Warningf("error getting status for %s: %v", m, err)
+			continue
+		}
+
+		if status == state.Running.String() {
+			h, err := api.Load(m)
+			if err != nil {
+				klog.Warningf("Failed to load machine %q: %v", m, err)
+				continue
+			}
+			runner, err := CommandRunner(h)
+			if err != nil {
+				return err
+			}
+			cr, err := cruntime.New(cruntime.Config{Type: c.KubernetesConfig.ContainerRuntime, Runner: runner})
+			if err != nil {
+				return errors.Wrap(err, "error creating container runtime")
+			}
+			list, err := cr.ListImages(cruntime.ListImagesOptions{})
+			if err != nil {
+				klog.Warningf("Failed to list images for profile %s %v", pName, err.Error())
+				continue
+			}
+			sort.Sort(sort.Reverse(sort.StringSlice(list)))
+			fmt.Printf(strings.Join(list, "\n") + "\n")
+		}
+	}
+
 	return nil
 }

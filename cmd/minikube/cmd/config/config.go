@@ -19,9 +19,10 @@ package config
 import (
 	"strings"
 
-	"github.com/golang/glog"
 	"github.com/spf13/cobra"
+	"k8s.io/klog/v2"
 	"k8s.io/minikube/pkg/minikube/config"
+	"k8s.io/minikube/pkg/minikube/driver"
 	"k8s.io/minikube/pkg/minikube/localpath"
 )
 
@@ -32,21 +33,23 @@ type setFn func(string, string) error
 
 // Setting represents a setting
 type Setting struct {
-	name        string
-	set         func(config.MinikubeConfig, string, string) error
-	setMap      func(config.MinikubeConfig, string, map[string]interface{}) error
-	validations []setFn
-	callbacks   []setFn
+	name          string
+	set           func(config.MinikubeConfig, string, string) error
+	setMap        func(config.MinikubeConfig, string, map[string]interface{}) error
+	validDefaults func() []string
+	validations   []setFn
+	callbacks     []setFn
 }
 
 // These are all the settings that are configurable
 // and their validation and callback fn run on Set
 var settings = []Setting{
 	{
-		name:        "driver",
-		set:         SetString,
-		validations: []setFn{IsValidDriver},
-		callbacks:   []setFn{RequiresRestartMsg},
+		name:          "driver",
+		set:           SetString,
+		validDefaults: driver.SupportedDrivers,
+		validations:   []setFn{IsValidDriver},
+		callbacks:     []setFn{RequiresRestartMsg},
 	},
 	{
 		name:        "vm-driver",
@@ -73,7 +76,7 @@ var settings = []Setting{
 	{
 		name:        "cpus",
 		set:         SetInt,
-		validations: []setFn{IsPositive},
+		validations: []setFn{IsValidCPUs},
 		callbacks:   []setFn{RequiresRestartMsg},
 	},
 	{
@@ -89,8 +92,8 @@ var settings = []Setting{
 	},
 	{
 		name:        "memory",
-		set:         SetInt,
-		validations: []setFn{IsPositive},
+		set:         SetString,
+		validations: []setFn{IsValidMemory},
 		callbacks:   []setFn{RequiresRestartMsg},
 	},
 	{
@@ -112,20 +115,12 @@ var settings = []Setting{
 		set:  SetBool,
 	},
 	{
+		name: config.WantBetaUpdateNotification,
+		set:  SetBool,
+	},
+	{
 		name: config.ReminderWaitPeriodInHours,
 		set:  SetInt,
-	},
-	{
-		name: config.WantReportError,
-		set:  SetBool,
-	},
-	{
-		name: config.WantReportErrorPrompt,
-		set:  SetBool,
-	},
-	{
-		name: config.WantKubectlDownloadMsg,
-		set:  SetBool,
 	},
 	{
 		name: config.WantNoneDriverWarning,
@@ -137,15 +132,7 @@ var settings = []Setting{
 	},
 	{
 		name: Bootstrapper,
-		set:  SetString, //TODO(r2d4): more validation here?
-	},
-	{
-		name: config.ShowDriverDeprecationNotification,
-		set:  SetBool,
-	},
-	{
-		name: config.ShowBootstrapperDeprecationNotification,
-		set:  SetBool,
+		set:  SetString,
 	},
 	{
 		name: "insecure-registry",
@@ -165,7 +152,7 @@ var settings = []Setting{
 		setMap: SetMap,
 	},
 	{
-		name: "embed-certs",
+		name: config.EmbedCerts,
 		set:  SetBool,
 	},
 	{
@@ -177,12 +164,12 @@ var settings = []Setting{
 // ConfigCmd represents the config command
 var ConfigCmd = &cobra.Command{
 	Use:   "config SUBCOMMAND [flags]",
-	Short: "Modify minikube config",
-	Long: `config modifies minikube config files using subcommands like "minikube config set driver kvm"
+	Short: "Modify persistent configuration values",
+	Long: `config modifies minikube config files using subcommands like "minikube config set driver kvm2"
 Configurable fields: ` + "\n\n" + configurableFields(),
 	Run: func(cmd *cobra.Command, args []string) {
 		if err := cmd.Help(); err != nil {
-			glog.Errorf("help: %v", err)
+			klog.ErrorS(err, "help")
 		}
 	},
 }

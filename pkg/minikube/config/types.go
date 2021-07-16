@@ -18,40 +18,45 @@ package config
 
 import (
 	"net"
+	"time"
 
-	"github.com/blang/semver"
+	"github.com/blang/semver/v4"
 )
 
 // Profile represents a minikube profile
 type Profile struct {
 	Name   string
-	Status string // running, stopped
+	Status string // running, stopped, paused, unknown
 	Config *ClusterConfig
 }
 
 // ClusterConfig contains the parameters used to start a cluster.
 type ClusterConfig struct {
 	Name                    string
-	KeepContext             bool // used by start and profile command to or not to switch kubectl's current context
-	EmbedCerts              bool // used by kubeconfig.Setup
-	MinikubeISO             string
+	KeepContext             bool   // used by start and profile command to or not to switch kubectl's current context
+	EmbedCerts              bool   // used by kubeconfig.Setup
+	MinikubeISO             string // ISO used for VM-drivers.
+	KicBaseImage            string // base-image used for docker/podman drivers.
 	Memory                  int
 	CPUs                    int
 	DiskSize                int
+	VMDriver                string // Legacy use only
 	Driver                  string
 	HyperkitVpnKitSock      string   // Only used by the Hyperkit driver
 	HyperkitVSockPorts      []string // Only used by the Hyperkit driver
 	DockerEnv               []string // Each entry is formatted as KEY=VALUE.
+	ContainerVolumeMounts   []string // Only used by container drivers: Docker, Podman
 	InsecureRegistry        []string
 	RegistryMirror          []string
 	HostOnlyCIDR            string // Only used by the virtualbox driver
 	HypervVirtualSwitch     string
 	HypervUseExternalSwitch bool
 	HypervExternalAdapter   string
-	KVMNetwork              string   // Only used by the KVM driver
-	KVMQemuURI              string   // Only used by kvm2
-	KVMGPU                  bool     // Only used by kvm2
-	KVMHidden               bool     // Only used by kvm2
+	KVMNetwork              string   // Only used by the KVM2 driver
+	KVMQemuURI              string   // Only used by the KVM2 driver
+	KVMGPU                  bool     // Only used by the KVM2 driver
+	KVMHidden               bool     // Only used by the KVM2 driver
+	KVMNUMACount            int      // Only used by the KVM2 driver
 	DockerOpt               []string // Each entry is formatted as KEY=VALUE.
 	DisableDriverMounts     bool     // Only used by virtualbox
 	NFSShare                []string
@@ -62,30 +67,48 @@ type ClusterConfig struct {
 	HostDNSResolver         bool   // Only used by virtualbox
 	HostOnlyNicType         string // Only used by virtualbox
 	NatNicType              string // Only used by virtualbox
+	SSHIPAddress            string // Only used by ssh driver
+	SSHUser                 string // Only used by ssh driver
+	SSHKey                  string // Only used by ssh driver
+	SSHPort                 int    // Only used by ssh driver
 	KubernetesConfig        KubernetesConfig
 	Nodes                   []Node
 	Addons                  map[string]bool
-	VerifyComponents        map[string]bool // map of components to verify and wait for after start.
+	CustomAddonImages       map[string]string // Maps image names to the image to use for addons. e.g. Dashboard -> k8s.gcr.io/echoserver:1.4 makes dashboard addon use echoserver for its Dashboard deployment.
+	CustomAddonRegistries   map[string]string // Maps image names to the registry to use for addons. See CustomAddonImages for example.
+	VerifyComponents        map[string]bool   // map of components to verify and wait for after start.
+	StartHostTimeout        time.Duration
+	ScheduledStop           *ScheduledStopConfig
+	ExposedPorts            []string // Only used by the docker and podman driver
+	ListenAddress           string   // Only used by the docker and podman driver
+	Network                 string   // only used by docker driver
+	MultiNodeRequested      bool
 }
 
 // KubernetesConfig contains the parameters used to configure the VM Kubernetes.
 type KubernetesConfig struct {
-	KubernetesVersion string
-	ClusterName       string
-	APIServerName     string
-	APIServerNames    []string
-	APIServerIPs      []net.IP
-	DNSDomain         string
-	ContainerRuntime  string
-	CRISocket         string
-	NetworkPlugin     string
-	FeatureGates      string // https://kubernetes.io/docs/reference/command-line-tools-reference/feature-gates/
-	ServiceCIDR       string // the subnet which kubernetes services will be deployed to
-	ImageRepository   string
-	ExtraOptions      ExtraOptionSlice
+	KubernetesVersion   string
+	ClusterName         string
+	Namespace           string
+	APIServerName       string
+	APIServerNames      []string
+	APIServerIPs        []net.IP
+	DNSDomain           string
+	ContainerRuntime    string
+	CRISocket           string
+	NetworkPlugin       string
+	FeatureGates        string // https://kubernetes.io/docs/reference/command-line-tools-reference/feature-gates/
+	ServiceCIDR         string // the subnet which Kubernetes services will be deployed to
+	ImageRepository     string
+	LoadBalancerStartIP string // currently only used by MetalLB addon
+	LoadBalancerEndIP   string // currently only used by MetalLB addon
+	CustomIngressCert   string // used by Ingress addon
+	ExtraOptions        ExtraOptionSlice
 
 	ShouldLoadCachedImages bool
-	EnableDefaultCNI       bool
+
+	EnableDefaultCNI bool   // deprecated in preference to CNI
+	CNI              string // CNI to use
 
 	// We need to keep these in the short term for backwards compatibility
 	NodeIP   string
@@ -126,4 +149,11 @@ type VersionedExtraOption struct {
 	// If it is the default value, it will have no lower bound on versions the
 	// flag is applied to
 	GreaterThanOrEqual semver.Version
+}
+
+// ScheduledStopConfig contains information around scheduled stop
+// not yet used, will be used to show status of scheduled stop
+type ScheduledStopConfig struct {
+	InitiationTime int64
+	Duration       time.Duration
 }

@@ -24,35 +24,32 @@ import (
 	"runtime"
 	"strings"
 
-	"github.com/golang/glog"
 	"github.com/pkg/errors"
 	"golang.org/x/sync/errgroup"
+
+	"k8s.io/klog/v2"
 	"k8s.io/minikube/pkg/minikube/command"
 	"k8s.io/minikube/pkg/minikube/config"
 	"k8s.io/minikube/pkg/minikube/constants"
 	"k8s.io/minikube/pkg/minikube/download"
 	"k8s.io/minikube/pkg/minikube/machine"
+	"k8s.io/minikube/pkg/minikube/sysinit"
 	"k8s.io/minikube/pkg/minikube/vmpath"
 )
 
 // TransferBinaries transfers all required Kubernetes binaries
-func TransferBinaries(cfg config.KubernetesConfig, c command.Runner) error {
+func TransferBinaries(cfg config.KubernetesConfig, c command.Runner, sm sysinit.Manager) error {
 	ok, err := binariesExist(cfg, c)
 	if err == nil && ok {
-		glog.Info("Found k8s binaries, skipping transfer")
+		klog.Info("Found k8s binaries, skipping transfer")
 		return nil
 	}
-	glog.Infof("Didn't find k8s binaries: %v\nInitiating transfer...", err)
+	klog.Infof("Didn't find k8s binaries: %v\nInitiating transfer...", err)
 
 	dir := binRoot(cfg.KubernetesVersion)
 	_, err = c.RunCmd(exec.Command("sudo", "mkdir", "-p", dir))
 	if err != nil {
 		return err
-	}
-
-	// stop kubelet to avoid "Text File Busy" error
-	if _, err := c.RunCmd(exec.Command("/bin/bash", "-c", "pgrep kubelet && sudo systemctl stop kubelet")); err != nil {
-		glog.Warningf("unable to stop kubelet: %s", err)
 	}
 
 	var g errgroup.Group
@@ -62,6 +59,12 @@ func TransferBinaries(cfg config.KubernetesConfig, c command.Runner) error {
 			src, err := download.Binary(name, cfg.KubernetesVersion, "linux", runtime.GOARCH)
 			if err != nil {
 				return errors.Wrapf(err, "downloading %s", name)
+			}
+
+			if name == "kubelet" && sm.Active(name) {
+				if err := sm.ForceStop(name); err != nil {
+					klog.Errorf("unable to stop kubelet: %v", err)
+				}
 			}
 
 			dst := path.Join(dir, name)

@@ -37,12 +37,20 @@ func MakeTempDir() string {
 	if err != nil {
 		log.Fatal(err)
 	}
-	err = os.MkdirAll(filepath.Join(tempDir, "cache", "iso"), 0777)
+	err = os.MkdirAll(filepath.Join(tempDir, "cache"), 0777)
 	if err != nil {
 		log.Fatal(err)
 	}
 	os.Setenv(localpath.MinikubeHome, tempDir)
 	return localpath.MiniPath()
+}
+
+// RemoveTempDir removes the temp dir
+func RemoveTempDir(tempdir string) {
+	if filepath.Base(tempdir) == ".minikube" {
+		tempdir = filepath.Dir(tempdir)
+	}
+	os.RemoveAll(tempdir)
 }
 
 // FakeFile satisfies fdWriter

@@ -17,19 +17,28 @@ limitations under the License.
 package driver
 
 import (
+	"fmt"
 	"net"
 
+	"k8s.io/klog/v2"
 	"k8s.io/minikube/pkg/drivers/kic/oci"
 	"k8s.io/minikube/pkg/minikube/config"
 	"k8s.io/minikube/pkg/minikube/constants"
 )
 
-// ControlPaneEndpoint returns the location where callers can reach this cluster
-func ControlPaneEndpoint(cc *config.ClusterConfig, cp *config.Node, driverName string) (string, net.IP, int, error) {
+// ControlPlaneEndpoint returns the location where callers can reach this cluster
+func ControlPlaneEndpoint(cc *config.ClusterConfig, cp *config.Node, driverName string) (string, net.IP, int, error) {
 	if NeedsPortForward(driverName) {
 		port, err := oci.ForwardedPort(cc.Driver, cc.Name, cp.Port)
-		hostname := oci.DefaultBindIPV4
+		if err != nil {
+			klog.Warningf("failed to get forwarded control plane port %v", err)
+		}
+		hostname := oci.DaemonHost(driverName)
+
 		ip := net.ParseIP(hostname)
+		if ip == nil {
+			return hostname, ip, port, fmt.Errorf("failed to parse ip for %q", hostname)
+		}
 
 		// https://github.com/kubernetes/minikube/issues/3878
 		if cc.KubernetesConfig.APIServerName != constants.APIServerName {
@@ -43,5 +52,15 @@ func ControlPaneEndpoint(cc *config.ClusterConfig, cp *config.Node, driverName s
 	if cc.KubernetesConfig.APIServerName != constants.APIServerName {
 		hostname = cc.KubernetesConfig.APIServerName
 	}
-	return hostname, net.ParseIP(cp.IP), cp.Port, nil
+	ip := net.ParseIP(cp.IP)
+	if ip == nil {
+		return hostname, ip, cp.Port, fmt.Errorf("failed to parse ip for %q", cp.IP)
+	}
+	return hostname, ip, cp.Port, nil
+}
+
+// AutoPauseProxyEndpoint returns the endpoint for the auto-pause (reverse proxy to api-sever)
+func AutoPauseProxyEndpoint(cc *config.ClusterConfig, cp *config.Node, driverName string) (string, net.IP, int, error) {
+	cp.Port = constants.AutoPauseProxyPort
+	return ControlPlaneEndpoint(cc, cp, driverName)
 }

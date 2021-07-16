@@ -22,7 +22,7 @@ import (
 	"fmt"
 	"os/exec"
 
-	parallels "github.com/Parallels/docker-machine-parallels"
+	parallels "github.com/Parallels/docker-machine-parallels/v2"
 	"github.com/docker/machine/libmachine/drivers"
 	"k8s.io/minikube/pkg/minikube/config"
 	"k8s.io/minikube/pkg/minikube/download"
@@ -36,6 +36,7 @@ func init() {
 		Name:     driver.Parallels,
 		Config:   configure,
 		Status:   status,
+		Default:  true,
 		Priority: registry.Default,
 		Init:     func() drivers.Driver { return parallels.NewDriver("", "") },
 	})
@@ -46,7 +47,7 @@ func init() {
 }
 
 func configure(cfg config.ClusterConfig, n config.Node) (interface{}, error) {
-	d := parallels.NewDriver(driver.MachineName(cfg, n), localpath.MiniPath()).(*parallels.Driver)
+	d := parallels.NewDriver(config.MachineName(cfg, n), localpath.MiniPath()).(*parallels.Driver)
 	d.Boot2DockerURL = download.LocalISOResource(cfg.MinikubeISO)
 	d.Memory = cfg.Memory
 	d.CPU = cfg.CPUs
@@ -55,9 +56,9 @@ func configure(cfg config.ClusterConfig, n config.Node) (interface{}, error) {
 }
 
 func status() registry.State {
-	_, err := exec.LookPath("docker-machine-driver-parallels")
+	_, err := exec.LookPath("prlctl")
 	if err != nil {
-		return registry.State{Error: err, Fix: "Install docker-machine-driver-parallels", Doc: "https://minikube.sigs.k8s.io/docs/reference/drivers/parallels/"}
+		return registry.State{Error: err, Fix: "Install Parallels Desktop for Mac", Doc: "https://minikube.sigs.k8s.io/docs/drivers/parallels/"}
 	}
 	return registry.State{Installed: true, Healthy: true}
 }

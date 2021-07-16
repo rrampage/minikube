@@ -18,12 +18,14 @@ package cmd
 
 import (
 	"github.com/spf13/cobra"
-	"k8s.io/minikube/pkg/minikube/driver"
+	"k8s.io/minikube/pkg/minikube/config"
 	"k8s.io/minikube/pkg/minikube/exit"
 	"k8s.io/minikube/pkg/minikube/machine"
 	"k8s.io/minikube/pkg/minikube/mustload"
 	"k8s.io/minikube/pkg/minikube/node"
 	"k8s.io/minikube/pkg/minikube/out"
+	"k8s.io/minikube/pkg/minikube/reason"
+	"k8s.io/minikube/pkg/minikube/style"
 )
 
 var nodeStopCmd = &cobra.Command{
@@ -32,27 +34,27 @@ var nodeStopCmd = &cobra.Command{
 	Long:  "Stops a node in a cluster.",
 	Run: func(cmd *cobra.Command, args []string) {
 		if len(args) == 0 {
-			exit.UsageT("Usage: minikube node stop [name]")
+			exit.Message(reason.Usage, "Usage: minikube node stop [name]")
 		}
 
 		name := args[0]
 		api, cc := mustload.Partial(ClusterFlagValue())
 
-		n, _, err := node.Retrieve(cc, name)
+		n, _, err := node.Retrieve(*cc, name)
 		if err != nil {
-			exit.WithError("retrieving node", err)
+			exit.Error(reason.GuestNodeRetrieve, "retrieving node", err)
 		}
 
-		machineName := driver.MachineName(*cc, *n)
+		machineName := config.MachineName(*cc, *n)
 
 		err = machine.StopHost(api, machineName)
 		if err != nil {
 			out.FatalT("Failed to stop node {{.name}}", out.V{"name": name})
 		}
+		out.Step(style.Stopped, "Successfully stopped node {{.name}}", out.V{"name": machineName})
 	},
 }
 
 func init() {
-	nodeStopCmd.Flags().String("name", "", "The name of the node to delete")
 	nodeCmd.AddCommand(nodeStopCmd)
 }

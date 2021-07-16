@@ -23,9 +23,12 @@ import (
 	"path"
 
 	"github.com/pkg/errors"
+	"k8s.io/minikube/pkg/drivers/kic/oci"
 	"k8s.io/minikube/pkg/minikube/bootstrapper/bsutil/ktmpl"
 	"k8s.io/minikube/pkg/minikube/bootstrapper/images"
+	"k8s.io/minikube/pkg/minikube/cni"
 	"k8s.io/minikube/pkg/minikube/config"
+	"k8s.io/minikube/pkg/minikube/constants"
 	"k8s.io/minikube/pkg/minikube/cruntime"
 	"k8s.io/minikube/pkg/minikube/driver"
 	"k8s.io/minikube/pkg/util"
@@ -35,7 +38,7 @@ func extraKubeletOpts(mc config.ClusterConfig, nc config.Node, r cruntime.Manage
 	k8s := mc.KubernetesConfig
 	version, err := util.ParseKubernetesVersion(k8s.KubernetesVersion)
 	if err != nil {
-		return nil, errors.Wrap(err, "parsing kubernetes version")
+		return nil, errors.Wrap(err, "parsing Kubernetes version")
 	}
 
 	extraOpts, err := extraConfigForComponent(Kubelet, k8s.ExtraOptions, version)
@@ -43,23 +46,27 @@ func extraKubeletOpts(mc config.ClusterConfig, nc config.Node, r cruntime.Manage
 		return nil, errors.Wrap(err, "generating extra configuration for kubelet")
 	}
 
-	cgroupDriver, err := r.CGroupDriver()
-	if err == nil {
-		extraOpts["cgroup-driver"] = cgroupDriver
-	}
-
 	for k, v := range r.KubeletOptions() {
 		extraOpts[k] = v
 	}
+
+	// avoid "Failed to start ContainerManager failed to initialise top level QOS containers" error (ref: https://github.com/kubernetes/kubernetes/issues/43856)
+	// avoid "kubelet crashes with: root container [kubepods] doesn't exist" (ref: https://github.com/kubernetes/kubernetes/issues/95488)
+	if mc.Driver == oci.Docker && mc.KubernetesConfig.ContainerRuntime == constants.CRIO {
+		extraOpts["cgroups-per-qos"] = "false"
+		extraOpts["enforce-node-allocatable"] = ""
+	}
+
 	if k8s.NetworkPlugin != "" {
 		extraOpts["network-plugin"] = k8s.NetworkPlugin
+
+		if k8s.NetworkPlugin == "kubenet" {
+			extraOpts["pod-cidr"] = cni.DefaultPodCIDR
+		}
 	}
-	cp, err := config.PrimaryControlPlane(&mc)
-	if err != nil {
-		return nil, errors.Wrap(err, "getting master node")
-	}
+
 	if _, ok := extraOpts["node-ip"]; !ok {
-		extraOpts["node-ip"] = cp.IP
+		extraOpts["node-ip"] = nc.IP
 	}
 	if _, ok := extraOpts["hostname-override"]; !ok {
 		nodeName := KubeNodeName(mc, nc)
@@ -126,5 +133,5 @@ func KubeNodeName(cc config.ClusterConfig, n config.Node) string {
 		hostname, _ := os.Hostname()
 		return hostname
 	}
-	return driver.MachineName(cc, n)
+	return config.MachineName(cc, n)
 }

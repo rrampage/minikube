@@ -19,6 +19,8 @@ package config
 import (
 	"fmt"
 	"strings"
+
+	"k8s.io/klog/v2"
 )
 
 // ExtraOption is an extra option
@@ -38,8 +40,39 @@ type ExtraOptionSlice []ExtraOption
 // ComponentExtraOptionMap maps components to their extra opts, which is a map of keys to values
 type ComponentExtraOptionMap map[string]map[string]string
 
+// Exists returns true if component.key (parsed from value) is already in ExtraOptionSlice
+func (es *ExtraOptionSlice) Exists(value string) bool {
+	// The component is the value before the first dot.
+	componentSplit := strings.SplitN(value, ".", 2)
+	if len(componentSplit) != 2 {
+		klog.Errorf("invalid value: must contain at least one period: %q", value)
+		return false
+	}
+
+	keySplit := strings.SplitN(componentSplit[1], "=", 2)
+	if len(keySplit) != 2 {
+		klog.Errorf("invalid value: must contain one equal sign: %q", value)
+		return false
+	}
+
+	for _, opt := range *es {
+		if opt.Component == componentSplit[0] && opt.Key == keySplit[0] {
+			return true
+		}
+	}
+	return false
+}
+
 // Set parses the string value into a slice
 func (es *ExtraOptionSlice) Set(value string) error {
+
+	// Check we don't end with suffix quotation.
+	prefixExists := strings.HasPrefix(value, "”") || strings.HasPrefix(value, "“")
+	suffixExists := strings.HasSuffix(value, "”") || strings.HasSuffix(value, "“")
+	if !prefixExists && suffixExists {
+		return fmt.Errorf("invalid value: extra-config cannot contain end quotation: %q", value)
+	}
+
 	// The component is the value before the first dot.
 	componentSplit := strings.SplitN(value, ".", 2)
 	if len(componentSplit) < 2 {

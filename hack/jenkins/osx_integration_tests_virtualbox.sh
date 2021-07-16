@@ -24,11 +24,11 @@
 # access_token: The Github API access token. Injected by the Jenkins credential provider.
 
 
-set -e
-OS_ARCH="darwin-amd64"
-VM_DRIVER="virtualbox"
+OS="darwin"
+ARCH="amd64"
+DRIVER="virtualbox"
 JOB_NAME="VirtualBox_macOS"
-EXTRA_ARGS="--bootstrapper=kubeadm"
+EXTRA_START_ARGS="--bootstrapper=kubeadm"
 # hyperkit behaves better, so it has higher precedence.
 # Assumes that hyperkit is also installed on the VirtualBox CI host.
 EXPECTED_DEFAULT_DRIVER="hyperkit"

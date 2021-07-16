@@ -19,11 +19,13 @@ package kic
 import (
 	"fmt"
 	"os/exec"
+	"runtime"
 
 	"github.com/phayes/freeport"
 	v1 "k8s.io/api/core/v1"
 
 	"k8s.io/minikube/pkg/minikube/out"
+	"k8s.io/minikube/pkg/minikube/style"
 )
 
 type sshConn struct {
@@ -38,7 +40,7 @@ func createSSHConn(name, sshPort, sshKey string, svc *v1.Service) *sshConn {
 	sshArgs := []string{
 		// TODO: document the options here
 		"-o", "UserKnownHostsFile=/dev/null",
-		"-o", "StrictHostKeyChecking no",
+		"-o", "StrictHostKeyChecking=no",
 		"-N",
 		"docker@127.0.0.1",
 		"-p", sshPort,
@@ -65,18 +67,21 @@ func createSSHConn(name, sshPort, sshKey string, svc *v1.Service) *sshConn {
 	}
 
 	command := "ssh"
-
-	if askForSudo {
-		out.T(
-			out.Warning,
+	if askForSudo && runtime.GOOS != "windows" {
+		out.Styled(
+			style.Warning,
 			"The service {{.service}} requires privileged ports to be exposed: {{.ports}}",
 			out.V{"service": svc.Name, "ports": fmt.Sprintf("%v", privilegedPorts)},
 		)
 
-		out.T(out.Permissions, "sudo permission will be asked for it.")
+		out.Styled(style.Permissions, "sudo permission will be asked for it.")
 
 		command = "sudo"
 		sshArgs = append([]string{"ssh"}, sshArgs...)
+	}
+
+	if askForSudo && runtime.GOOS == "windows" {
+		out.WarningT("Access to ports below 1024 may fail on Windows with OpenSSH clients older than v8.1. For more information, see: https://minikube.sigs.k8s.io/docs/handbook/accessing/#access-to-ports-1024-on-windows-requires-root-permission")
 	}
 
 	cmd := exec.Command(command, sshArgs...)
@@ -93,7 +98,7 @@ func createSSHConnWithRandomPorts(name, sshPort, sshKey string, svc *v1.Service)
 	sshArgs := []string{
 		// TODO: document the options here
 		"-o", "UserKnownHostsFile=/dev/null",
-		"-o", "StrictHostKeyChecking no",
+		"-o", "StrictHostKeyChecking=no",
 		"-N",
 		"docker@127.0.0.1",
 		"-p", sshPort,
@@ -130,7 +135,7 @@ func createSSHConnWithRandomPorts(name, sshPort, sshKey string, svc *v1.Service)
 }
 
 func (c *sshConn) startAndWait() error {
-	out.T(out.Running, "Starting tunnel for service {{.service}}.", out.V{"service": c.service})
+	out.Step(style.Running, "Starting tunnel for service {{.service}}.", out.V{"service": c.service})
 
 	err := c.cmd.Start()
 	if err != nil {
@@ -144,7 +149,7 @@ func (c *sshConn) startAndWait() error {
 }
 
 func (c *sshConn) stop() error {
-	out.T(out.Stopping, "Stopping tunnel for service {{.service}}.", out.V{"service": c.service})
+	out.Step(style.Stopping, "Stopping tunnel for service {{.service}}.", out.V{"service": c.service})
 
 	return c.cmd.Process.Kill()
 }

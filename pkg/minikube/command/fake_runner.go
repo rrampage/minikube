@@ -26,9 +26,9 @@ import (
 
 	"golang.org/x/sync/syncmap"
 
-	"github.com/golang/glog"
 	"github.com/pkg/errors"
 
+	"k8s.io/klog/v2"
 	"k8s.io/minikube/pkg/minikube/assets"
 )
 
@@ -50,7 +50,7 @@ func NewFakeCommandRunner() *FakeCommandRunner {
 // RunCmd implements the Command Runner interface to run a exec.Cmd object
 func (f *FakeCommandRunner) RunCmd(cmd *exec.Cmd) (*RunResult, error) {
 	rr := &RunResult{Args: cmd.Args}
-	glog.Infof("(FakeCommandRunner) Run:  %v", rr.Command())
+	klog.Infof("(FakeCommandRunner) Run:  %v", rr.Command())
 
 	start := time.Now()
 
@@ -85,9 +85,50 @@ func (f *FakeCommandRunner) RunCmd(cmd *exec.Cmd) (*RunResult, error) {
 
 	// Reduce log spam
 	if elapsed > (1 * time.Second) {
-		glog.Infof("(FakeCommandRunner) Done: %v: (%s)", rr.Command(), elapsed)
+		klog.Infof("(FakeCommandRunner) Done: %v: (%s)", rr.Command(), elapsed)
 	}
 	return rr, nil
+}
+
+// StartCmd implements the Command Runner interface to start a exec.Cmd object
+func (f *FakeCommandRunner) StartCmd(cmd *exec.Cmd) (*StartedCmd, error) {
+	rr := &RunResult{Args: cmd.Args}
+	sc := &StartedCmd{cmd: cmd, rr: rr}
+	klog.Infof("(FakeCommandRunner) Start:  %v", rr.Command())
+
+	key := rr.Command()
+	out, ok := f.cmdMap.Load(key)
+	if !ok {
+		cmds := f.commands()
+		if len(cmds) == 0 {
+			return sc, fmt.Errorf("asked to execute %s, but FakeCommandRunner has no commands stored", rr.Command())
+		}
+
+		var txt strings.Builder
+		for _, c := range f.commands() {
+			txt.WriteString(fmt.Sprintf("  `%s`\n", c))
+		}
+		return sc, fmt.Errorf("unregistered command:\n  `%s`\nexpected one of:\n%s", key, txt.String())
+	}
+
+	var buf bytes.Buffer
+	outStr := ""
+	if out != nil {
+		outStr = out.(string)
+	}
+	_, err := buf.WriteString(outStr)
+	if err != nil {
+		return sc, errors.Wrap(err, "Writing outStr to FakeCommandRunner's buffer")
+	}
+	rr.Stdout = buf
+	rr.Stderr = buf
+
+	return sc, nil
+}
+
+// WaitCmd implements the Command Runner interface to wait until a started exec.Cmd object finishes
+func (f *FakeCommandRunner) WaitCmd(sc *StartedCmd) (*RunResult, error) {
+	return sc.rr, nil
 }
 
 // Copy adds the filename, file contents key value pair to the stored map.
@@ -97,13 +138,13 @@ func (f *FakeCommandRunner) Copy(file assets.CopyableFile) error {
 	if err != nil {
 		return errors.Wrapf(err, "error reading file: %+v", file)
 	}
-	f.fileMap.Store(file.GetAssetName(), b.String())
+	f.fileMap.Store(file.GetSourcePath(), b.String())
 	return nil
 }
 
 // Remove removes the filename, file contents key value pair from the stored map
 func (f *FakeCommandRunner) Remove(file assets.CopyableFile) error {
-	f.fileMap.Delete(file.GetAssetName())
+	f.fileMap.Delete(file.GetSourcePath())
 	return nil
 }
 
@@ -117,7 +158,7 @@ func (f *FakeCommandRunner) SetFileToContents(fileToContents map[string]string) 
 // SetCommandToOutput stores the file to contents map for the FakeCommandRunner
 func (f *FakeCommandRunner) SetCommandToOutput(cmdToOutput map[string]string) {
 	for k, v := range cmdToOutput {
-		glog.Infof("fake command %q -> %q", k, v)
+		klog.Infof("fake command %q -> %q", k, v)
 		f.cmdMap.Store(k, v)
 	}
 }

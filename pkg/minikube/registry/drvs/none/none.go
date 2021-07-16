@@ -34,10 +34,12 @@ import (
 func init() {
 	if err := registry.Register(registry.DriverDef{
 		Name:     driver.None,
+		Alias:    []string{driver.AliasNative},
 		Config:   configure,
 		Init:     func() drivers.Driver { return none.NewDriver(none.Config{}) },
 		Status:   status,
-		Priority: registry.Discouraged, // requires root
+		Default:  false, // no isolation
+		Priority: registry.Discouraged,
 	}); err != nil {
 		panic(fmt.Sprintf("register failed: %v", err))
 	}
@@ -45,29 +47,32 @@ func init() {
 
 func configure(cc config.ClusterConfig, n config.Node) (interface{}, error) {
 	return none.NewDriver(none.Config{
-		MachineName:      driver.MachineName(cc, n),
+		MachineName:      config.MachineName(cc, n),
 		StorePath:        localpath.MiniPath(),
 		ContainerRuntime: cc.KubernetesConfig.ContainerRuntime,
 	}), nil
 }
 
 func status() registry.State {
-	if _, err := exec.LookPath("systemctl"); err != nil {
-		return registry.State{Error: err, Fix: "Use a systemd based Linux distribution", Doc: "https://minikube.sigs.k8s.io/docs/reference/drivers/none/"}
+	_, err := exec.LookPath("iptables")
+	if err != nil {
+		return registry.State{Running: true, Error: err, Fix: "iptables must be installed", Doc: "https://minikube.sigs.k8s.io/docs/reference/drivers/none/"}
 	}
 
 	if _, err := exec.LookPath("docker"); err != nil {
-		return registry.State{Error: err, Installed: false, Fix: "Install docker", Doc: "https://minikube.sigs.k8s.io/docs/reference/drivers/none/"}
+		return registry.State{Running: true, Error: err, Installed: false, Fix: "Install docker", Doc: "https://minikube.sigs.k8s.io/docs/reference/drivers/none/"}
 	}
 
 	u, err := user.Current()
 	if err != nil {
-		return registry.State{Error: err, Healthy: false, Doc: "https://minikube.sigs.k8s.io/docs/reference/drivers/none/"}
+		return registry.State{Running: true, Error: err, Healthy: false, Doc: "https://minikube.sigs.k8s.io/docs/reference/drivers/none/"}
 	}
 
 	if u.Uid != "0" {
-		return registry.State{Error: fmt.Errorf("the 'none' driver must be run as the root user"), Healthy: false, Fix: "For non-root usage, try the newer 'docker' driver", Installed: true}
+		test := exec.Command("sudo", "-n", "echo", "-n")
+		if err := test.Run(); err != nil {
+			return registry.State{Error: fmt.Errorf("running the 'none' driver as a regular user requires sudo permissions"), Healthy: false}
+		}
 	}
-
 	return registry.State{Installed: true, Healthy: true}
 }

@@ -20,12 +20,15 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 
-	"github.com/golang/glog"
 	"github.com/pkg/errors"
 	"k8s.io/client-go/rest"
+	"k8s.io/klog/v2"
+	"k8s.io/minikube/pkg/minikube/config"
+	"k8s.io/minikube/pkg/minikube/out"
 )
 
 // EnvVars are variables we plumb through to the underlying container runtime
@@ -40,19 +43,28 @@ func isInBlock(ip string, block string) (bool, error) {
 		return false, fmt.Errorf("CIDR is nil")
 	}
 
+	if ip == block {
+		return true, nil
+	}
+
 	i := net.ParseIP(ip)
 	if i == nil {
 		return false, fmt.Errorf("parsed IP is nil")
 	}
-	_, b, err := net.ParseCIDR(block)
-	if err != nil {
-		return false, errors.Wrapf(err, "Error Parsing block %s", b)
+
+	// check the block if it's CIDR
+	if strings.Contains(block, "/") {
+		_, b, err := net.ParseCIDR(block)
+		if err != nil {
+			return false, errors.Wrapf(err, "Error Parsing block %s", b)
+		}
+
+		if b.Contains(i) {
+			return true, nil
+		}
 	}
 
-	if b.Contains(i) {
-		return true, nil
-	}
-	return false, errors.Wrapf(err, "Error ip not in block")
+	return false, errors.New("Error ip not in block")
 }
 
 // ExcludeIP takes ip or CIDR as string and excludes it from the http(s)_proxy
@@ -101,7 +113,11 @@ func checkEnv(ip string, env string) bool {
 	// Checks if included in IP ranges, i.e., 192.168.39.13/24
 	noProxyBlocks := strings.Split(v, ",")
 	for _, b := range noProxyBlocks {
-		if yes, _ := isInBlock(ip, b); yes {
+		yes, err := isInBlock(ip, b)
+		if err != nil {
+			klog.Warningf("fail to check proxy env: %v", err)
+		}
+		if yes {
 			return true
 		}
 	}
@@ -130,9 +146,54 @@ func UpdateTransport(cfg *rest.Config) *rest.Config {
 			ht.Proxy = nil
 			rt = ht
 		} else {
-			glog.Errorf("Error while casting RoundTripper (of type %T) to *http.Transport : %v", rt, ok)
+			klog.Errorf("Error while casting RoundTripper (of type %T) to *http.Transport : %v", rt, ok)
 		}
 		return rt
 	}
 	return cfg
+}
+
+// SetDockerEnv sets the proxy environment variables in the docker environment.
+func SetDockerEnv() []string {
+	for _, k := range EnvVars {
+		if v := os.Getenv(k); v != "" {
+			// convert https_proxy to HTTPS_PROXY for linux
+			// TODO (@medyagh): if user has both http_proxy & HTTPS_PROXY set merge them.
+			k = strings.ToUpper(k)
+			if k == "HTTP_PROXY" || k == "HTTPS_PROXY" {
+				isLocalProxy := func(url string) bool {
+					return strings.HasPrefix(url, "localhost") || strings.HasPrefix(url, "127.0")
+				}
+
+				normalizedURL := v
+				if !strings.Contains(v, "://") {
+					normalizedURL = "http://" + v // by default, assumes the url is HTTP scheme
+				}
+				u, err := url.Parse(normalizedURL)
+				if err != nil {
+					out.WarningT("Error parsing {{.name}}={{.value}}, {{.err}}", out.V{"name": k, "value": v, "err": err})
+					continue
+				}
+
+				if isLocalProxy(u.Host) {
+					out.WarningT("Local proxy ignored: not passing {{.name}}={{.value}} to docker env.", out.V{"name": k, "value": v})
+					continue
+				}
+			}
+			config.DockerEnv = append(config.DockerEnv, fmt.Sprintf("%s=%s", k, v))
+		}
+	}
+
+	// remove duplicates
+	seen := map[string]bool{}
+	uniqueEnvs := []string{}
+	for e := range config.DockerEnv {
+		if !seen[config.DockerEnv[e]] {
+			seen[config.DockerEnv[e]] = true
+			uniqueEnvs = append(uniqueEnvs, config.DockerEnv[e])
+		}
+	}
+	config.DockerEnv = uniqueEnvs
+
+	return config.DockerEnv
 }

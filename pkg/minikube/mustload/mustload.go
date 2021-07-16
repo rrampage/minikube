@@ -20,12 +20,11 @@ package mustload
 import (
 	"fmt"
 	"net"
-	"os"
 
 	"github.com/docker/machine/libmachine"
 	"github.com/docker/machine/libmachine/host"
 	"github.com/docker/machine/libmachine/state"
-	"github.com/golang/glog"
+	"k8s.io/klog/v2"
 	"k8s.io/minikube/pkg/minikube/bootstrapper/bsutil/kverify"
 	"k8s.io/minikube/pkg/minikube/command"
 	"k8s.io/minikube/pkg/minikube/config"
@@ -34,6 +33,8 @@ import (
 	"k8s.io/minikube/pkg/minikube/exit"
 	"k8s.io/minikube/pkg/minikube/machine"
 	"k8s.io/minikube/pkg/minikube/out"
+	"k8s.io/minikube/pkg/minikube/reason"
+	"k8s.io/minikube/pkg/minikube/style"
 )
 
 // ClusterController holds all the needed information for a minikube cluster
@@ -60,20 +61,20 @@ type ControlPlane struct {
 }
 
 // Partial is a cmd-friendly way to load a cluster which may or may not be running
-func Partial(name string) (libmachine.API, *config.ClusterConfig) {
-	glog.Infof("Loading cluster: %s", name)
-	api, err := machine.NewAPIClient()
+func Partial(name string, miniHome ...string) (libmachine.API, *config.ClusterConfig) {
+	klog.Infof("Loading cluster: %s", name)
+	api, err := machine.NewAPIClient(miniHome...)
 	if err != nil {
-		exit.WithError("libmachine failed", err)
+		exit.Error(reason.NewAPIClient, "libmachine failed", err)
 	}
 
-	cc, err := config.Load(name)
+	cc, err := config.Load(name, miniHome...)
 	if err != nil {
 		if config.IsNotExist(err) {
-			out.T(out.Shrug, `There is no local cluster named "{{.cluster}}"`, out.V{"cluster": name})
-			exitTip("start", name, exit.Data)
+			out.Styled(style.Shrug, `Profile "{{.cluster}}" not found. Run "minikube profile list" to view all profiles.`, out.V{"cluster": name})
+			exitTip("start", name, reason.ExGuestNotFound)
 		}
-		exit.WithError("Error getting cluster config", err)
+		exit.Error(reason.HostConfigLoad, "Error getting cluster config", err)
 	}
 
 	return api, cc
@@ -85,43 +86,43 @@ func Running(name string) ClusterController {
 
 	cp, err := config.PrimaryControlPlane(cc)
 	if err != nil {
-		exit.WithError("Unable to find control plane", err)
+		exit.Error(reason.GuestCpConfig, "Unable to find control plane", err)
 	}
 
-	machineName := driver.MachineName(*cc, cp)
+	machineName := config.MachineName(*cc, cp)
 	hs, err := machine.Status(api, machineName)
 	if err != nil {
-		exit.WithError("Unable to get machine status", err)
+		exit.Error(reason.GuestStatus, "Unable to get machine status", err)
 	}
 
 	if hs == state.None.String() {
-		out.T(out.Shrug, `The control plane node "{{.name}}" does not exist.`, out.V{"name": cp.Name})
-		exitTip("start", name, exit.Unavailable)
+		out.Styled(style.Shrug, `The control plane node "{{.name}}" does not exist.`, out.V{"name": cp.Name})
+		exitTip("start", name, reason.ExGuestNotFound)
 	}
 
 	if hs == state.Stopped.String() {
-		out.T(out.Shrug, `The control plane node must be running for this command`)
-		exitTip("start", name, exit.Unavailable)
+		out.Styled(style.Shrug, `The control plane node must be running for this command`)
+		exitTip("start", name, reason.ExGuestUnavailable)
 	}
 
 	if hs != state.Running.String() {
-		out.T(out.Shrug, `The control plane node is not running (state={{.state}})`, out.V{"name": cp.Name, "state": hs})
-		exitTip("start", name, exit.Unavailable)
+		out.Styled(style.Shrug, `The control plane node is not running (state={{.state}})`, out.V{"name": cp.Name, "state": hs})
+		exitTip("start", name, reason.ExSvcUnavailable)
 	}
 
 	host, err := machine.LoadHost(api, name)
 	if err != nil {
-		exit.WithError("Unable to load host", err)
+		exit.Error(reason.GuestLoadHost, "Unable to load host", err)
 	}
 
 	cr, err := machine.CommandRunner(host)
 	if err != nil {
-		exit.WithError("Unable to get command runner", err)
+		exit.Error(reason.InternalCommandRunner, "Unable to get command runner", err)
 	}
 
-	hostname, ip, port, err := driver.ControlPaneEndpoint(cc, &cp, host.DriverName)
+	hostname, ip, port, err := driver.ControlPlaneEndpoint(cc, &cp, host.DriverName)
 	if err != nil {
-		exit.WithError("Unable to get forwarded endpoint", err)
+		exit.Error(reason.DrvCPEndpoint, "Unable to get forwarded endpoint", err)
 	}
 
 	return ClusterController{
@@ -145,18 +146,18 @@ func Healthy(name string) ClusterController {
 	as, err := kverify.APIServerStatus(co.CP.Runner, co.CP.Hostname, co.CP.Port)
 	if err != nil {
 		out.FailureT(`Unable to get control plane status: {{.error}}`, out.V{"error": err})
-		exitTip("delete", name, exit.Unavailable)
+		exitTip("delete", name, reason.ExSvcError)
 	}
 
 	if as == state.Paused {
-		out.T(out.Shrug, `The control plane for "{{.name}}" is paused!`, out.V{"name": name})
-		exitTip("unpause", name, exit.Unavailable)
+		out.Styled(style.Shrug, `The control plane for "{{.name}}" is paused!`, out.V{"name": name})
+		exitTip("unpause", name, reason.ExSvcConfig)
 	}
 
 	if as != state.Running {
-		out.T(out.Shrug, `This control plane is not running! (state={{.state}})`, out.V{"state": as.String()})
+		out.Styled(style.Shrug, `This control plane is not running! (state={{.state}})`, out.V{"state": as.String()})
 		out.WarningT(`This is unusual - you may want to investigate using "{{.command}}"`, out.V{"command": ExampleCmd(name, "logs")})
-		exitTip("start", name, exit.Unavailable)
+		exitTip("start", name, reason.ExSvcUnavailable)
 	}
 	return co
 }
@@ -172,6 +173,6 @@ func ExampleCmd(cname string, action string) string {
 // exitTip returns an action tip and exits
 func exitTip(action string, profile string, code int) {
 	command := ExampleCmd(profile, action)
-	out.T(out.Workaround, `To fix this, run: "{{.command}}"`, out.V{"command": command})
-	os.Exit(code)
+	out.Styled(style.Workaround, `To start a cluster, run: "{{.command}}"`, out.V{"command": command})
+	exit.Code(code)
 }

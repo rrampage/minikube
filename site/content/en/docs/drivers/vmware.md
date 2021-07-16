@@ -10,20 +10,20 @@ aliases:
 The vmware driver supports virtualization across all VMware based hypervisors.
 
 {{% tabs %}}
-{{% tab "macOS" %}}
-{{% readfile file="/docs/drivers/includes/vmware_macos_usage.inc" %}}
-{{% /tab %}}
-{{% tab "Linux" %}}
+{{% mactab %}}
+{{% readfile file="/docs/drivers/includes/vmware_macos_usage.inc" %}} vmware_windows_usage.inc
+{{% /mactab %}}
+{{% linuxtab %}}
 No documentation is available yet.
-{{% /tab %}}
-{{% tab "Windows" %}}
-No documentation is available yet.
-{{% /tab %}}
+{{% /linuxtab %}}
+{{% windowstab %}}
+{{% readfile file="/docs/drivers/includes/vmware_windows_usage.inc" %}} 
+{{% /windowstab %}}
 {{% /tabs %}}
 
 ## Issues
 
-* [Full list of open 'vmware' driver issues](https://github.com/kubernetes/minikube/labels/co%2Fvmware)
+* [Full list of open 'vmware-driver' issues](https://github.com/kubernetes/minikube/labels/co%2Fvmware-driver)
 
 ## Troubleshooting
 

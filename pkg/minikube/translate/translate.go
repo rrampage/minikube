@@ -19,12 +19,15 @@ package translate
 import (
 	"encoding/json"
 	"fmt"
-	"path"
+	"os"
+	"runtime"
 	"strings"
 
 	"github.com/cloudfoundry-attic/jibber_jabber"
-	"github.com/golang/glog"
 	"golang.org/x/text/language"
+
+	"k8s.io/klog/v2"
+	"k8s.io/minikube/translations"
 )
 
 var (
@@ -59,70 +62,70 @@ func T(s string) string {
 
 // DetermineLocale finds the system locale and sets the preferred language for output appropriately.
 func DetermineLocale() {
-	locale, err := jibber_jabber.DetectIETF()
-	if err != nil {
-		glog.Infof("Getting system locale failed: %v", err)
-		locale = ""
+	var locale string
+	// Allow windows users to overload the same env vars as unix users
+	if runtime.GOOS == "windows" {
+		locale = os.Getenv("LC_ALL")
 	}
-	err = SetPreferredLanguage(locale)
-	if err != nil {
-		glog.Infof("Setting locale failed: %v", err)
-		preferredLanguage = defaultLanguage
+	if locale == "" {
+		var err error
+		locale, err = jibber_jabber.DetectIETF()
+		if err != nil {
+			klog.V(1).Infof("Getting system locale failed: %v", err)
+			locale = ""
+		}
 	}
-
-	if preferredLanguage == defaultLanguage {
-		return
-	}
+	SetPreferredLanguage(locale)
 
 	// Load translations for preferred language into memory.
 	p := preferredLanguage.String()
-	translationFile := path.Join("translations", fmt.Sprintf("%s.json", p))
-	t, err := Asset(translationFile)
+	t, err := translations.Translations.ReadFile(fmt.Sprintf("%s.json", p))
 	if err != nil {
 		// Attempt to find a more broad locale, e.g. fr instead of fr-FR.
 		if strings.Contains(p, "-") {
 			p = strings.Split(p, "-")[0]
-			translationFile := path.Join("translations", fmt.Sprintf("%s.json", p))
-			t, err = Asset(translationFile)
+			t, err = translations.Translations.ReadFile(fmt.Sprintf("%s.json", p))
 			if err != nil {
-				glog.Infof("Failed to load translation file for %s: %v", p, err)
+				klog.V(1).Infof("Failed to load translation file for %s: %v", p, err)
 				return
 			}
 		} else {
-			glog.Infof("Failed to load translation file for %s: %v", preferredLanguage.String(), err)
+			klog.V(1).Infof("Failed to load translation file for %s: %v", preferredLanguage.String(), err)
 			return
 		}
 	}
 
 	err = json.Unmarshal(t, &Translations)
 	if err != nil {
-		glog.Infof("Failed to populate translation map: %v", err)
+		klog.V(1).Infof("Failed to populate translation map: %v", err)
 	}
 
 }
 
 // setPreferredLanguageTag configures which language future messages should use.
 func setPreferredLanguageTag(l language.Tag) {
-	glog.Infof("Setting Language to %s ...", l)
+	// output message only if verbosity level is set and we still haven't got all the flags parsed in main()
+	klog.V(1).Infof("Setting Language to %s ...", l)
 	preferredLanguage = l
 }
 
 // SetPreferredLanguage configures which language future messages should use, based on a LANG string.
-func SetPreferredLanguage(s string) error {
+func SetPreferredLanguage(s string) {
 	// "C" is commonly used to denote a neutral POSIX locale. See http://pubs.opengroup.org/onlinepubs/009695399/basedefs/xbd_chap07.html#tag_07_02
 	if s == "" || s == "C" {
 		setPreferredLanguageTag(defaultLanguage)
-		return nil
+		return
 	}
 	// Handles "de_DE" or "de_DE.utf8"
 	// We don't process encodings, since Rob Pike invented utf8 and we're mostly stuck with it.
+	// Fallback to the default language if not detected
 	parts := strings.Split(s, ".")
 	l, err := language.Parse(parts[0])
 	if err != nil {
-		return err
+		setPreferredLanguageTag(defaultLanguage)
+		return
 	}
 	setPreferredLanguageTag(l)
-	return nil
 }
 
 // GetPreferredLanguage returns the preferred language tag.

@@ -19,62 +19,65 @@ package machine
 import (
 	"encoding/json"
 	"fmt"
+	"net"
+	"os"
 	"os/exec"
 	"path"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/docker/machine/libmachine"
 	"github.com/docker/machine/libmachine/drivers"
 	"github.com/docker/machine/libmachine/engine"
 	"github.com/docker/machine/libmachine/host"
-	"github.com/golang/glog"
 	"github.com/juju/mutex"
 	"github.com/pkg/errors"
-	"github.com/spf13/viper"
-	"golang.org/x/crypto/ssh"
+	"k8s.io/klog/v2"
 	"k8s.io/minikube/pkg/drivers/kic/oci"
 	"k8s.io/minikube/pkg/minikube/command"
 	"k8s.io/minikube/pkg/minikube/config"
 	"k8s.io/minikube/pkg/minikube/constants"
 	"k8s.io/minikube/pkg/minikube/driver"
+	"k8s.io/minikube/pkg/minikube/exit"
 	"k8s.io/minikube/pkg/minikube/localpath"
 	"k8s.io/minikube/pkg/minikube/out"
+	"k8s.io/minikube/pkg/minikube/out/register"
+	"k8s.io/minikube/pkg/minikube/proxy"
+	"k8s.io/minikube/pkg/minikube/reason"
 	"k8s.io/minikube/pkg/minikube/registry"
-	"k8s.io/minikube/pkg/minikube/sshutil"
+	"k8s.io/minikube/pkg/minikube/style"
 	"k8s.io/minikube/pkg/minikube/vmpath"
 	"k8s.io/minikube/pkg/util/lock"
-	"k8s.io/minikube/pkg/util/retry"
 )
 
-var (
-	// requiredDirectories are directories to create on the host during setup
-	requiredDirectories = []string{
-		vmpath.GuestAddonsDir,
-		vmpath.GuestManifestsDir,
-		vmpath.GuestEphemeralDir,
-		vmpath.GuestPersistentDir,
-		vmpath.GuestKubernetesCertsDir,
-		path.Join(vmpath.GuestPersistentDir, "images"),
-		path.Join(vmpath.GuestPersistentDir, "binaries"),
-		vmpath.GuestGvisorDir,
-		vmpath.GuestCertAuthDir,
-		vmpath.GuestCertStoreDir,
-	}
-)
+// requiredDirectories are directories to create on the host during setup
+var requiredDirectories = []string{
+	vmpath.GuestAddonsDir,
+	vmpath.GuestManifestsDir,
+	vmpath.GuestEphemeralDir,
+	vmpath.GuestPersistentDir,
+	vmpath.GuestKubernetesCertsDir,
+	path.Join(vmpath.GuestPersistentDir, "images"),
+	path.Join(vmpath.GuestPersistentDir, "binaries"),
+	vmpath.GuestGvisorDir,
+	vmpath.GuestCertAuthDir,
+	vmpath.GuestCertStoreDir,
+}
 
 // StartHost starts a host VM.
-func StartHost(api libmachine.API, cfg config.ClusterConfig, n config.Node) (*host.Host, bool, error) {
-	machineName := driver.MachineName(cfg, n)
+func StartHost(api libmachine.API, cfg *config.ClusterConfig, n *config.Node) (*host.Host, bool, error) {
+	machineName := config.MachineName(*cfg, *n)
 
 	// Prevent machine-driver boot races, as well as our own certificate race
-	releaser, err := acquireMachinesLock(machineName)
+	releaser, err := acquireMachinesLock(machineName, cfg.Driver)
 	if err != nil {
 		return nil, false, errors.Wrap(err, "boot lock")
 	}
 	start := time.Now()
 	defer func() {
-		glog.Infof("releasing machines lock for %q, held for %s", machineName, time.Since(start))
+		klog.Infof("releasing machines lock for %q, held for %s", machineName, time.Since(start))
 		releaser.Release()
 	}()
 
@@ -83,18 +86,34 @@ func StartHost(api libmachine.API, cfg config.ClusterConfig, n config.Node) (*ho
 		return nil, false, errors.Wrapf(err, "exists: %s", machineName)
 	}
 	if !exists {
-		glog.Infof("Provisioning new machine with config: %+v %+v", cfg, n)
+		klog.Infof("Provisioning new machine with config: %+v %+v", cfg, n)
 		h, err := createHost(api, cfg, n)
 		return h, exists, err
 	}
-	glog.Infoln("Skipping create...Using existing machine configuration")
+	klog.Infoln("Skipping create...Using existing machine configuration")
 	h, err := fixHost(api, cfg, n)
 	return h, exists, err
 }
 
+// engineOptions returns docker engine options for the dockerd running inside minikube
 func engineOptions(cfg config.ClusterConfig) *engine.Options {
+	// get docker env from user's proxy settings
+	dockerEnv := proxy.SetDockerEnv()
+	// get docker env from user specifiec config
+	dockerEnv = append(dockerEnv, cfg.DockerEnv...)
+
+	// remove duplicates
+	seen := map[string]bool{}
+	uniqueEnvs := []string{}
+	for e := range dockerEnv {
+		if !seen[dockerEnv[e]] {
+			seen[dockerEnv[e]] = true
+			uniqueEnvs = append(uniqueEnvs, dockerEnv[e])
+		}
+	}
+
 	o := engine.Options{
-		Env:              cfg.DockerEnv,
+		Env:              uniqueEnvs,
 		InsecureRegistry: append([]string{constants.DefaultServiceCIDR}, cfg.InsecureRegistry...),
 		RegistryMirror:   cfg.RegistryMirror,
 		ArbitraryFlags:   cfg.DockerOpt,
@@ -103,25 +122,22 @@ func engineOptions(cfg config.ClusterConfig) *engine.Options {
 	return &o
 }
 
-func createHost(api libmachine.API, cfg config.ClusterConfig, n config.Node) (*host.Host, error) {
-	glog.Infof("createHost starting for %q (driver=%q)", n.Name, cfg.Driver)
+func createHost(api libmachine.API, cfg *config.ClusterConfig, n *config.Node) (*host.Host, error) {
+	klog.Infof("createHost starting for %q (driver=%q)", n.Name, cfg.Driver)
 	start := time.Now()
 	defer func() {
-		glog.Infof("createHost completed in %s", time.Since(start))
+		klog.Infof("duration metric: createHost completed in %s", time.Since(start))
 	}()
 
-	if cfg.Driver == driver.VMwareFusion && viper.GetBool(config.ShowDriverDeprecationNotification) {
-		out.WarningT(`The vmwarefusion driver is deprecated and support for it will be removed in a future release.
-			Please consider switching to the new vmware unified driver, which is intended to replace the vmwarefusion driver.
-			See https://minikube.sigs.k8s.io/docs/reference/drivers/vmware/ for more information.
-			To disable this message, run [minikube config set ShowDriverDeprecationNotification false]`)
+	if cfg.Driver != driver.SSH {
+		showHostInfo(nil, *cfg)
 	}
-	showHostInfo(cfg)
+
 	def := registry.Driver(cfg.Driver)
 	if def.Empty() {
 		return nil, fmt.Errorf("unsupported/missing driver: %s", cfg.Driver)
 	}
-	dd, err := def.Config(cfg, n)
+	dd, err := def.Config(*cfg, *n)
 	if err != nil {
 		return nil, errors.Wrap(err, "config")
 	}
@@ -134,25 +150,32 @@ func createHost(api libmachine.API, cfg config.ClusterConfig, n config.Node) (*h
 	if err != nil {
 		return nil, errors.Wrap(err, "new host")
 	}
+	defer postStartValidations(h, cfg.Driver)
 
 	h.HostOptions.AuthOptions.CertDir = localpath.MiniPath()
 	h.HostOptions.AuthOptions.StorePath = localpath.MiniPath()
-	h.HostOptions.EngineOptions = engineOptions(cfg)
+	h.HostOptions.EngineOptions = engineOptions(*cfg)
 
 	cstart := time.Now()
-	glog.Infof("libmachine.API.Create for %q (driver=%q)", cfg.Name, cfg.Driver)
-	// Allow two minutes to create host before failing fast
-	if err := timedCreateHost(h, api, 2*time.Minute); err != nil {
+	klog.Infof("libmachine.API.Create for %q (driver=%q)", cfg.Name, cfg.Driver)
+
+	if cfg.StartHostTimeout == 0 {
+		cfg.StartHostTimeout = 6 * time.Minute
+	}
+	if err := timedCreateHost(h, api, cfg.StartHostTimeout); err != nil {
 		return nil, errors.Wrap(err, "creating host")
 	}
-	glog.Infof("libmachine.API.Create for %q took %s", cfg.Name, time.Since(cstart))
+	klog.Infof("duration metric: libmachine.API.Create for %q took %s", cfg.Name, time.Since(cstart))
+	if cfg.Driver == driver.SSH {
+		showHostInfo(h, *cfg)
+	}
 
-	if err := postStartSetup(h, cfg); err != nil {
+	if err := postStartSetup(h, *cfg); err != nil {
 		return h, errors.Wrap(err, "post-start")
 	}
 
-	if err := api.Save(h); err != nil {
-		return nil, errors.Wrap(err, "save")
+	if err := saveHost(api, h, cfg, n); err != nil {
+		return h, err
 	}
 	return h, nil
 }
@@ -184,21 +207,76 @@ func timedCreateHost(h *host.Host, api libmachine.API, t time.Duration) error {
 	}
 }
 
+// postStartValidations are validations against the host after it is created
+// TODO: Add validations for VM drivers as well, see issue #9035
+func postStartValidations(h *host.Host, drvName string) {
+	if !driver.IsKIC(drvName) {
+		return
+	}
+	r, err := CommandRunner(h)
+	if err != nil {
+		klog.Warningf("error getting command runner: %v", err)
+	}
+
+	var kind reason.Kind
+	var name string
+	if drvName == oci.Docker {
+		kind = reason.RsrcInsufficientDockerStorage
+		name = "Docker"
+	}
+	if drvName == oci.Podman {
+		kind = reason.RsrcInsufficientPodmanStorage
+		name = "Podman"
+	}
+	if name == "" {
+		klog.Warningf("unknown KIC driver: %v", drvName)
+		return
+	}
+
+	// make sure /var isn't full,  as pod deployments will fail if it is
+	percentageFull, err := DiskUsed(r, "/var")
+	if err != nil {
+		klog.Warningf("error getting percentage of /var that is free: %v", err)
+	}
+	if percentageFull >= 99 {
+		exit.Message(kind, `{{.n}} is out of disk space! (/var is at {{.p}}% of capacity)`, out.V{"n": name, "p": percentageFull})
+	}
+
+	if percentageFull >= 85 {
+		out.WarnReason(kind, `{{.n}} is nearly out of disk space, which may cause deployments to fail! ({{.p}}% of capacity)`, out.V{"n": name, "p": percentageFull})
+	}
+}
+
+// DiskUsed returns the capacity of dir in the VM/container as a percentage
+func DiskUsed(cr command.Runner, dir string) (int, error) {
+	if s := os.Getenv(constants.TestDiskUsedEnv); s != "" {
+		return strconv.Atoi(s)
+	}
+	output, err := cr.RunCmd(exec.Command("sh", "-c", fmt.Sprintf("df -h %s | awk 'NR==2{print $5}'", dir)))
+	if err != nil {
+		klog.Warningf("error running df -h /var: %v\n%v", err, output.Output())
+		return 0, err
+	}
+	percentage := strings.TrimSpace(output.Stdout.String())
+	percentage = strings.Trim(percentage, "%")
+	return strconv.Atoi(percentage)
+}
+
 // postStart are functions shared between startHost and fixHost
 func postStartSetup(h *host.Host, mc config.ClusterConfig) error {
-	glog.Infof("post-start starting for %q (driver=%q)", h.Name, h.DriverName)
+	klog.Infof("post-start starting for %q (driver=%q)", h.Name, h.DriverName)
 	start := time.Now()
 	defer func() {
-		glog.Infof("post-start completed in %s", time.Since(start))
+		klog.Infof("post-start completed in %s", time.Since(start))
 	}()
 
 	if driver.IsMock(h.DriverName) {
 		return nil
 	}
 
-	glog.Infof("creating required directories: %v", requiredDirectories)
+	klog.Infof("creating required directories: %v", requiredDirectories)
 
-	r, err := commandRunner(h)
+	r, err := CommandRunner(h)
 	if err != nil {
 		return errors.Wrap(err, "command runner")
 	}
@@ -211,80 +289,94 @@ func postStartSetup(h *host.Host, mc config.ClusterConfig) error {
 	if driver.BareMetal(mc.Driver) {
 		showLocalOsRelease()
 	}
-	if driver.IsVM(mc.Driver) {
+	if driver.IsVM(mc.Driver) || driver.IsKIC(mc.Driver) || driver.IsSSH(mc.Driver) {
 		logRemoteOsRelease(r)
 	}
 	return syncLocalAssets(r)
 }
 
-// commandRunner returns best available command runner for this host
-func commandRunner(h *host.Host) (command.Runner, error) {
-	d := h.Driver.DriverName()
-	glog.V(1).Infof("determining appropriate runner for %q", d)
-	if driver.IsMock(d) {
-		glog.Infof("returning FakeCommandRunner for %q driver", d)
-		return &command.FakeCommandRunner{}, nil
-	}
-
-	if driver.BareMetal(h.Driver.DriverName()) {
-		glog.Infof("returning ExecRunner for %q driver", d)
-		return command.NewExecRunner(), nil
-	}
-	if driver.IsKIC(d) {
-		glog.Infof("Returning KICRunner for %q driver", d)
-		return command.NewKICRunner(h.Name, d), nil
-	}
-
-	glog.Infof("Creating SSH client and returning SSHRunner for %q driver", d)
-
-	// Retry in order to survive an ssh restart, which sometimes happens due to provisioning
-	var sc *ssh.Client
-	getSSH := func() (err error) {
-		sc, err = sshutil.NewSSHClient(h.Driver)
-		return err
-	}
-
-	if err := retry.Expo(getSSH, 250*time.Millisecond, 2*time.Second); err != nil {
-		return nil, err
-	}
-
-	return command.NewSSHRunner(sc), nil
-}
-
 // acquireMachinesLock protects against code that is not parallel-safe (libmachine, cert setup)
-func acquireMachinesLock(name string) (mutex.Releaser, error) {
-	spec := lock.PathMutexSpec(filepath.Join(localpath.MiniPath(), "machines"))
+func acquireMachinesLock(name string, drv string) (mutex.Releaser, error) {
+	lockPath := filepath.Join(localpath.MiniPath(), "machines", drv)
+	// With KIC, it's safe to provision multiple hosts simultaneously
+	if driver.IsKIC(drv) {
+		lockPath = filepath.Join(localpath.MiniPath(), "machines", drv, name)
+	}
+	spec := lock.PathMutexSpec(lockPath)
 	// NOTE: Provisioning generally completes within 60 seconds
-	spec.Timeout = 15 * time.Minute
+	// however in parallel integration testing it might take longer
+	spec.Timeout = 13 * time.Minute
+	if driver.IsKIC(drv) {
+		spec.Timeout = 10 * time.Minute
+	}
 
-	glog.Infof("acquiring machines lock for %s: %+v", name, spec)
+	klog.Infof("acquiring machines lock for %s: %+v", name, spec)
 	start := time.Now()
 	r, err := mutex.Acquire(spec)
 	if err == nil {
-		glog.Infof("acquired machines lock for %q in %s", name, time.Since(start))
+		klog.Infof("acquired machines lock for %q in %s", name, time.Since(start))
 	}
 	return r, err
 }
 
 // showHostInfo shows host information
-func showHostInfo(cfg config.ClusterConfig) {
+func showHostInfo(h *host.Host, cfg config.ClusterConfig) {
 	machineType := driver.MachineType(cfg.Driver)
 	if driver.BareMetal(cfg.Driver) {
-		info, err := getHostInfo()
-		if err == nil {
-			out.T(out.StartingNone, "Running on localhost (CPUs={{.number_of_cpus}}, Memory={{.memory_size}}MB, Disk={{.disk_size}}MB) ...", out.V{"number_of_cpus": info.CPUs, "memory_size": info.Memory, "disk_size": info.DiskSize})
+		info, cpuErr, memErr, DiskErr := LocalHostInfo()
+		if cpuErr == nil && memErr == nil && DiskErr == nil {
+			register.Reg.SetStep(register.RunningLocalhost)
+			out.Step(style.StartingNone, "Running on localhost (CPUs={{.number_of_cpus}}, Memory={{.memory_size}}MB, Disk={{.disk_size}}MB) ...", out.V{"number_of_cpus": info.CPUs, "memory_size": info.Memory, "disk_size": info.DiskSize})
+		}
+		return
+	}
+	if driver.IsSSH(cfg.Driver) {
+		r, err := CommandRunner(h)
+		if err != nil {
+			klog.Warningf("error getting command runner: %v", err)
+			return
+		}
+		info, cpuErr, memErr, DiskErr := RemoteHostInfo(r)
+		if cpuErr == nil && memErr == nil && DiskErr == nil {
+			register.Reg.SetStep(register.RunningRemotely)
+			out.Step(style.StartingSSH, "Running remotely (CPUs={{.number_of_cpus}}, Memory={{.memory_size}}MB, Disk={{.disk_size}}MB) ...", out.V{"number_of_cpus": info.CPUs, "memory_size": info.Memory, "disk_size": info.DiskSize})
 		}
 		return
 	}
 	if driver.IsKIC(cfg.Driver) { // TODO:medyagh add free disk space on docker machine
-		s, err := oci.DaemonInfo(cfg.Driver)
-		if err == nil {
-			var info hostInfo
-			info.CPUs = s.CPUs
-			info.Memory = megs(uint64(s.TotalMemory))
-			out.T(out.StartingVM, "Creating Kubernetes in {{.driver_name}} {{.machine_type}} with (CPUs={{.number_of_cpus}}) ({{.number_of_host_cpus}} available), Memory={{.memory_size}}MB ({{.host_memory_size}}MB available) ...", out.V{"driver_name": cfg.Driver, "number_of_cpus": cfg.CPUs, "number_of_host_cpus": info.CPUs, "memory_size": cfg.Memory, "host_memory_size": info.Memory, "machine_type": machineType})
-		}
+		register.Reg.SetStep(register.CreatingContainer)
+		out.Step(style.StartingVM, "Creating {{.driver_name}} {{.machine_type}} (CPUs={{.number_of_cpus}}, Memory={{.memory_size}}MB) ...", out.V{"driver_name": cfg.Driver, "number_of_cpus": cfg.CPUs, "memory_size": cfg.Memory, "machine_type": machineType})
 		return
 	}
-	out.T(out.StartingVM, "Creating {{.driver_name}} {{.machine_type}} (CPUs={{.number_of_cpus}}, Memory={{.memory_size}}MB, Disk={{.disk_size}}MB) ...", out.V{"driver_name": cfg.Driver, "number_of_cpus": cfg.CPUs, "memory_size": cfg.Memory, "disk_size": cfg.DiskSize, "machine_type": machineType})
+	register.Reg.SetStep(register.CreatingVM)
+	out.Step(style.StartingVM, "Creating {{.driver_name}} {{.machine_type}} (CPUs={{.number_of_cpus}}, Memory={{.memory_size}}MB, Disk={{.disk_size}}MB) ...", out.V{"driver_name": cfg.Driver, "number_of_cpus": cfg.CPUs, "memory_size": cfg.Memory, "disk_size": cfg.DiskSize, "machine_type": machineType})
+}
+
+// AddHostAlias makes fine adjustments to pod resources that aren't possible via kubeadm config.
+func AddHostAlias(c command.Runner, name string, ip net.IP) error {
+	record := fmt.Sprintf("%s\t%s", ip, name)
+	if _, err := c.RunCmd(exec.Command("grep", record+"$", "/etc/hosts")); err == nil {
+		return nil
+	}
+
+	if _, err := c.RunCmd(addHostAliasCommand(name, record, true, "/etc/hosts")); err != nil {
+		return errors.Wrap(err, "hosts update")
+	}
+	return nil
+}
+
+func addHostAliasCommand(name string, record string, sudo bool, path string) *exec.Cmd {
+	sudoCmd := "sudo"
+	if !sudo { // for testing
+		sudoCmd = ""
+	}
+
+	script := fmt.Sprintf(
+		`{ grep -v $'\t%s$' "%s"; echo "%s"; } > /tmp/h.$$; %s cp /tmp/h.$$ "%s"`,
+		name,
+		path,
+		record,
+		sudoCmd,
+		path)
+	return exec.Command("/bin/bash", "-c", script)
 }

@@ -17,17 +17,23 @@ limitations under the License.
 package images
 
 import (
+	"fmt"
 	"strings"
 
-	"github.com/blang/semver"
-	"github.com/pkg/errors"
+	"github.com/blang/semver/v4"
 )
 
 // Kubeadm returns a list of images necessary to bootstrap kubeadm
 func Kubeadm(mirror string, version string) ([]string, error) {
 	v, err := semver.Make(strings.TrimPrefix(version, "v"))
 	if err != nil {
-		return nil, errors.Wrap(err, "semver")
+		return nil, fmt.Errorf("semver: %w", err)
+	}
+	if v.Major > 1 {
+		return nil, fmt.Errorf("version too new: %v", v)
+	}
+	if semver.MustParseRange("<1.12.0-alpha.0")(v) {
+		return nil, fmt.Errorf("version too old: %v", v)
 	}
 	imgs := essentials(mirror, v)
 	imgs = append(imgs, auxiliary(mirror)...)

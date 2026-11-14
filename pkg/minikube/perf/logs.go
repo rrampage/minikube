@@ -1,0 +1,75 @@
+/*
+Copyright 2020 The Kubernetes Authors All rights reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package perf
+
+import (
+	"bufio"
+	"fmt"
+	"log"
+	"os/exec"
+	"strings"
+	"time"
+
+	"k8s.io/klog/v2"
+)
+
+// timeCommandLogs runs command and watches stdout to time how long each new log takes
+// it stores each log, and the time it took, in result
+func timeCommandLogs(cmd *exec.Cmd) (*result, error) {
+	// matches each log with the amount of time spent on that log
+	r := newResult()
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, fmt.Errorf("getting stdout pipe: %w", err)
+	}
+	scanner := bufio.NewScanner(stdout)
+	scanner.Split(bufio.ScanLines)
+
+	log.Printf("Running: %v...", cmd.Args)
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("starting cmd: %w", err)
+	}
+
+	timer := time.Now()
+	var logs []string
+	var timings []float64
+
+	for scanner.Scan() {
+		logData := scanner.Text()
+		// this is the time it took to complete the previous log
+		timeTaken := time.Since(timer).Seconds()
+		klog.Infof("%f: %s", timeTaken, logData)
+
+		timer = time.Now()
+		logs = append(logs, logData)
+		timings = append(timings, timeTaken)
+	}
+	if err := scanner.Err(); err != nil {
+		klog.Warningf("failed to read command output: %v", err)
+	}
+	// add the time it took to get from the final log to finishing the command
+	timings = append(timings, time.Since(timer).Seconds())
+	for i, lg := range logs {
+		r.addTimedLog(strings.Trim(lg, "\n"), timings[i+1])
+	}
+
+	if err := cmd.Wait(); err != nil {
+		return nil, fmt.Errorf("waiting for minikube: %w", err)
+	}
+	return r, nil
+}

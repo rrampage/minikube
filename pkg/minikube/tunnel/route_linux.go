@@ -22,7 +22,7 @@ import (
 	"os/exec"
 	"strings"
 
-	"github.com/golang/glog"
+	"k8s.io/klog/v2"
 )
 
 func (router *osRouter) EnsureRouteIsAdded(route *Route) error {
@@ -37,17 +37,17 @@ func (router *osRouter) EnsureRouteIsAdded(route *Route) error {
 	serviceCIDR := route.DestCIDR.String()
 	gatewayIP := route.Gateway.String()
 
-	glog.Infof("Adding route for CIDR %s to gateway %s", serviceCIDR, gatewayIP)
+	klog.Infof("Adding route for CIDR %s to gateway %s", serviceCIDR, gatewayIP)
 	command := exec.Command("sudo", "ip", "route", "add", serviceCIDR, "via", gatewayIP)
-	glog.Infof("About to run command: %s", command.Args)
+	klog.Infof("About to run command: %s", command.Args)
 	stdInAndOut, err := command.CombinedOutput()
 	message := string(stdInAndOut)
 	if len(message) > 0 {
 		return fmt.Errorf("error adding Route: %s, %d", message, len(strings.Split(message, "\n")))
 	}
-	glog.Info(stdInAndOut)
+	klog.Info(stdInAndOut)
 	if err != nil {
-		glog.Errorf("error adding Route: %s, %d", message, len(strings.Split(message, "\n")))
+		klog.Errorf("error adding Route: %s, %d", message, len(strings.Split(message, "\n")))
 		return err
 	}
 	return nil
@@ -59,13 +59,13 @@ func (router *osRouter) Inspect(route *Route) (exists bool, conflict string, ove
 	stdInAndOut, err := cmd.CombinedOutput()
 	if err != nil {
 		err = fmt.Errorf("error running '%v': %s", cmd, err)
-		return
+		return false, "", nil, err
 	}
 	rt := router.parseTable(stdInAndOut)
 
 	exists, conflict, overlaps = rt.Check(route)
 
-	return
+	return exists, conflict, overlaps, nil
 }
 
 func (router *osRouter) parseTable(table []byte) routingTable {
@@ -94,12 +94,12 @@ func (router *osRouter) parseTable(table []byte) routingTable {
 			}
 
 			_, ipNet, err := net.ParseCIDR(dstCIDRString)
-			if err != nil {
-				glog.V(4).Infof("skipping line: can't parse CIDR from routing table: %s", dstCIDRString)
-			} else if gatewayIP == nil {
-				glog.V(4).Infof("skipping line: can't parse IP from routing table: %s", gatewayIPString)
-			} else {
-
+			switch {
+			case err != nil:
+				klog.V(4).Infof("skipping line: can't parse CIDR from routing table: %s", dstCIDRString)
+			case gatewayIP == nil:
+				klog.V(4).Infof("skipping line: can't parse IP from routing table: %s", gatewayIPString)
+			default:
 				tableLine := routingTableLine{
 					route: &Route{
 						DestCIDR: ipNet,
@@ -126,11 +126,11 @@ func (router *osRouter) Cleanup(route *Route) error {
 	serviceCIDR := route.DestCIDR.String()
 	gatewayIP := route.Gateway.String()
 
-	glog.Infof("Cleaning up route for CIDR %s to gateway %s\n", serviceCIDR, gatewayIP)
+	klog.Infof("Cleaning up route for CIDR %s to gateway %s\n", serviceCIDR, gatewayIP)
 	command := exec.Command("sudo", "ip", "route", "delete", serviceCIDR)
 	stdInAndOut, err := command.CombinedOutput()
-	message := fmt.Sprintf("%s", stdInAndOut)
-	glog.Infof("%s", message)
+	message := string(stdInAndOut)
+	klog.Infof("%s", message)
 	if err != nil {
 		return fmt.Errorf("error deleting Route: %s, %s", message, err)
 	}

@@ -1,4 +1,4 @@
-// +build windows
+//go:build windows
 
 /*
 Copyright 2018 The Kubernetes Authors All rights reserved.
@@ -19,12 +19,11 @@ limitations under the License.
 package hyperv
 
 import (
-	"bufio"
 	"bytes"
 	"os/exec"
 	"strings"
 
-	"github.com/golang/glog"
+	"k8s.io/klog/v2"
 )
 
 var powershell string
@@ -36,29 +35,21 @@ func init() {
 func cmdOut(args ...string) (string, error) {
 	args = append([]string{"-NoProfile", "-NonInteractive"}, args...)
 	cmd := exec.Command(powershell, args...)
-	glog.Infof("[executing ==>] : %v %v", powershell, strings.Join(args, " "))
+	klog.Infof("[executing ==>] : %v %v", powershell, strings.Join(args, " "))
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	err := cmd.Run()
-	glog.Infof("[stdout =====>] : %s", stdout.String())
-	glog.Infof("[stderr =====>] : %s", stderr.String())
+	klog.Infof("[stdout =====>] : %s", stdout.String())
+	klog.Infof("[stderr =====>] : %s", stderr.String())
+	if err != nil {
+		klog.Infof("[err =====>] : %v", err)
+	}
 	return stdout.String(), err
 }
 
 func cmd(args ...string) error {
 	_, err := cmdOut(args...)
 	return err
-}
-
-func parseLines(stdout string) []string {
-	var resp []string
-
-	s := bufio.NewScanner(strings.NewReader(stdout))
-	for s.Scan() {
-		resp = append(resp, s.Text())
-	}
-
-	return resp
 }

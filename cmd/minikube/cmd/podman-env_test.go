@@ -20,8 +20,8 @@ import (
 	"bytes"
 	"testing"
 
-	"github.com/docker/machine/libmachine/ssh"
 	"github.com/google/go-cmp/cmp"
+	"k8s.io/minikube/pkg/libmachine/ssh"
 )
 
 func newFakeClient() *ssh.ExternalClient {
@@ -41,20 +41,37 @@ func TestGeneratePodmanScripts(t *testing.T) {
 	}{
 		{
 			"bash",
-			PodmanEnvConfig{profile: "bash", driver: "kvm2", client: newFakeClient()},
+			PodmanEnvConfig{profile: "bash", driver: "kvm2", varlink: true, client: newFakeClient()},
 			nil,
 			`export PODMAN_VARLINK_BRIDGE="/usr/bin/ssh root@host -- sudo varlink -A \'podman varlink \\\$VARLINK_ADDRESS\' bridge"
+export MINIKUBE_ACTIVE_PODMAN="bash"
 
 # To point your shell to minikube's podman service, run:
 # eval $(minikube -p bash podman-env)
 `,
-			`unset PODMAN_VARLINK_BRIDGE
+			`unset PODMAN_VARLINK_BRIDGE;
+unset MINIKUBE_ACTIVE_PODMAN;
+`,
+		},
+		{
+			"bash",
+			PodmanEnvConfig{profile: "bash", driver: "kvm2", client: newFakeClient(), username: "root", hostname: "host", port: 22},
+			nil,
+			`export CONTAINER_HOST="ssh://root@host:22/run/podman/podman.sock"
+export MINIKUBE_ACTIVE_PODMAN="bash"
+
+# To point your shell to minikube's podman service, run:
+# eval $(minikube -p bash podman-env)
+`,
+			`unset CONTAINER_HOST;
+unset CONTAINER_SSHKEY;
+unset MINIKUBE_ACTIVE_PODMAN;
 `,
 		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.config.profile, func(t *testing.T) {
-			tc.config.EnvConfig.Shell = tc.shell
+			tc.config.Shell = tc.shell
 			defaultNoProxyGetter = tc.noProxyGetter
 			var b []byte
 			buf := bytes.NewBuffer(b)

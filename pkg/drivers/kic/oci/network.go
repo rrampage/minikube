@@ -24,59 +24,132 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/golang/glog"
-	"github.com/pkg/errors"
+	"errors"
+
+	"github.com/blang/semver/v4"
+
+	"k8s.io/klog/v2"
+	"k8s.io/minikube/pkg/minikube/constants"
 )
 
 // RoutableHostIPFromInside returns the ip/dns of the host that container lives on
 // is routable from inside the container
-func RoutableHostIPFromInside(ociBin string, containerName string) (net.IP, error) {
-	if ociBin != Docker {
-		return nil, fmt.Errorf("RoutableHostIPFromInside is currently only implemented for docker https://github.com/containers/libpod/issues/5205")
+func RoutableHostIPFromInside(ociBin string, clusterName string, containerName string) (net.IP, error) {
+	si, err := CachedDaemonInfo(ociBin)
+	if err != nil {
+		return nil, err
 	}
+	if si.Rootless {
+		if IsExternalDaemonHost(ociBin) {
+			return nil, errors.New("function RoutableHostIPFromInside is not implemented for external rootless daemons")
+			// TODO: parse DaemonHost()
+		}
+		addrs, err := net.InterfaceAddrs()
+		if err != nil {
+			return nil, err
+		}
+		for _, addr := range addrs {
+			var ip net.IP
+			switch v := addr.(type) {
+			case *net.IPAddr:
+				ip = v.IP
+			case *net.IPNet:
+				ip = v.IP
+			}
+			if ip != nil && !ip.IsLoopback() {
+				return ip, nil
+			}
+		}
+		return nil, fmt.Errorf("could not detect host IP, tried %v", addrs)
+	}
+	if ociBin == Docker {
+		if runtime.GOOS == "linux" {
+			info, err := containerNetworkInspect(ociBin, clusterName)
+			if err != nil {
+				if errors.Is(err, ErrNetworkNotFound) {
+					klog.Infof("The container %s is not attached to a network, this could be because the cluster was created by minikube <v1.14, will try to get the IP using container gateway", containerName)
+
+					return containerGatewayIP(Docker, containerName)
+				}
+				return info.gateway, fmt.Errorf("network inspect: %w", err)
+			}
+			return info.gateway, nil
+		}
+		// for windows and mac, the gateway ip is not routable so we use dns trick.
+		return digDNS(ociBin, containerName, "host.docker.internal")
+	}
+	// podman
 	if runtime.GOOS == "linux" {
-		return dockerGatewayIP()
+		return containerGatewayIP(ociBin, containerName)
 	}
-	// for windows and mac, the gateway ip is not routable so we use dns trick.
-	return digDNS(ociBin, containerName, "host.docker.internal")
+	// Podman on macOS and Windows can run inside a VM; host.containers.internal
+	// is the supported DNS entry for host access (similar to host.docker.internal for Docker)
+	if runtime.GOOS == "darwin" || runtime.GOOS == "windows" {
+		return digDNS(ociBin, containerName, "host.containers.internal")
+	}
+	return nil, fmt.Errorf("RoutableHostIPFromInside not implemented for podman on %s", runtime.GOOS)
 }
 
 // digDNS will get the IP record for a dns
 func digDNS(ociBin, containerName, dns string) (net.IP, error) {
-	cmd := exec.Command(ociBin, "exec", "-t", containerName, "dig", "+short", dns)
-	out, err := cmd.CombinedOutput()
-	ip := net.ParseIP(strings.TrimSpace(string(out)))
-
+	rr, err := runCmd(exec.Command(ociBin, "exec", "-t", containerName, "dig", "+short", dns))
+	ip := net.ParseIP(strings.TrimSpace(rr.Stdout.String()))
 	if err != nil {
-		return ip, errors.Wrapf(err, "resolve dns to ip: %s", string(out))
+		return ip, fmt.Errorf("resolve dns to ip: %w", err)
 	}
 
-	glog.Infof("got host ip for mount in container by digging dns: %s", ip.String())
+	klog.Infof("got host ip for mount in container by digging dns: %s", ip.String())
 	return ip, nil
 }
 
-// dockerGatewayIP gets the default gateway ip for the docker bridge on the user's host machine
-// gets the ip from user's host docker
-func dockerGatewayIP() (net.IP, error) {
-	cmd := exec.Command(Docker, "network", "ls", "--filter", "name=bridge", "--format", "{{.ID}}")
-	out, err := cmd.CombinedOutput()
-
+// gatewayIP inspects oci container to find a gateway IP string
+func gatewayIP(ociBin, containerName string) (string, error) {
+	rr, err := runCmd(exec.Command(ociBin, "container", "inspect", "--format", "{{.NetworkSettings.Gateway}}", containerName))
 	if err != nil {
-		return nil, errors.Wrapf(err, "get network bridge. output: %s", string(out))
+		return "", fmt.Errorf("inspect gateway: %w", err)
+	}
+	if gatewayIP := strings.TrimSpace(rr.Stdout.String()); gatewayIP != "" {
+		return gatewayIP, nil
 	}
 
-	bridgeID := strings.TrimSpace(string(out))
-	cmd = exec.Command(Docker, "inspect",
-		"--format", "{{(index .IPAM.Config 0).Gateway}}", bridgeID)
-	out, err = cmd.CombinedOutput()
-
-	if err != nil {
-		return nil, errors.Wrapf(err, "inspect IP gatway for bridge network: %q. output: %s", string(out), bridgeID)
+	// https://github.com/kubernetes/minikube/issues/11293
+	// need to check nested network
+	// check .NetworkSettings.Networks["cluster-name"].Gateway and then
+	// .NetworkSettings.Networks["bridge"|"podman"].Gateway
+	for _, network := range []string{containerName, defaultBridgeName(ociBin)} {
+		gatewayIP, err := networkGateway(ociBin, containerName, network)
+		// err == nil here doesn't mean we get a valid gateway IP, it still can be an empty string
+		if err != nil {
+			return "", err
+		}
+		if gatewayIP != "" {
+			return gatewayIP, nil
+		}
 	}
+	klog.Infof("Couldn't find gateway for container %s", containerName)
+	return "", nil
+}
 
-	ip := net.ParseIP(strings.TrimSpace(string(out)))
-	glog.Infof("got host ip for mount in container by inspect docker network: %s", ip.String())
-	return ip, nil
+func networkGateway(ociBin, container, network string) (string, error) {
+	format := fmt.Sprintf(`
+{{ if index .NetworkSettings.Networks %q}} 
+	{{(index .NetworkSettings.Networks %q).Gateway}}
+{{ end }}
+`, network, network)
+	rr, err := runCmd(exec.Command(ociBin, "container", "inspect", "--format", format, container))
+	if err != nil {
+		return "", fmt.Errorf("inspect gateway: %w", err)
+	}
+	return strings.TrimSpace(rr.Stdout.String()), nil
+}
+
+// containerGatewayIP gets the default gateway ip for the container
+func containerGatewayIP(ociBin string, containerName string) (net.IP, error) {
+	gatewayIP, err := gatewayIP(ociBin, containerName)
+	if err != nil {
+		return nil, fmt.Errorf("inspect gateway: %w", err)
+	}
+	return net.ParseIP(gatewayIP), nil
 }
 
 // ForwardedPort will return port mapping for a container using cli.
@@ -84,76 +157,93 @@ func dockerGatewayIP() (net.IP, error) {
 // will return the docker assigned port:
 // 32769, nil
 // only supports TCP ports
-func ForwardedPort(ociBinary string, ociID string, contPort int) (int, error) {
-	var out []byte
+func ForwardedPort(ociBin string, ociID string, contPort int) (int, error) {
+	var rr *RunResult
 	var err error
+	var v semver.Version
 
-	if ociBinary == Podman {
-		//podman inspect -f "{{range .NetworkSettings.Ports}}{{if eq .ContainerPort "80"}}{{.HostPort}}{{end}}{{end}}"
-		cmd := exec.Command(ociBinary, "inspect", "-f", fmt.Sprintf("{{range .NetworkSettings.Ports}}{{if eq .ContainerPort %s}}{{.HostPort}}{{end}}{{end}}", fmt.Sprint(contPort)), ociID)
-		out, err = cmd.CombinedOutput()
+	if ociBin == Podman {
+		v, err = podmanVersion()
 		if err != nil {
-			return 0, errors.Wrapf(err, "get host-bind port %d for %q, output %s", contPort, ociID, out)
-		}
-	} else {
-		cmd := exec.Command(ociBinary, "inspect", "-f", fmt.Sprintf("'{{(index (index .NetworkSettings.Ports \"%d/tcp\") 0).HostPort}}'", contPort), ociID)
-		out, err = cmd.CombinedOutput()
-		if err != nil {
-			return 0, errors.Wrapf(err, "get host-bind port %d for %q, output %s", contPort, ociID, out)
+			return 0, fmt.Errorf("podman version: %w", err)
 		}
 	}
 
-	o := strings.TrimSpace(string(out))
+	// podman 2.0.1 introduced docker syntax for .NetworkSettings.Ports (podman#5380)
+	if ociBin == Podman && v.LT(semver.Version{Major: 2, Minor: 0, Patch: 1}) {
+		rr, err = runCmd(exec.Command(ociBin, "container", "inspect", "-f", fmt.Sprintf("{{range .NetworkSettings.Ports}}{{if eq .ContainerPort %s}}{{.HostPort}}{{end}}{{end}}", fmt.Sprint(contPort)), ociID))
+		if err != nil {
+			return 0, fmt.Errorf("get port %d for %q: %w", contPort, ociID, err)
+		}
+	} else {
+		rr, err = runCmd(exec.Command(ociBin, "container", "inspect", "-f", fmt.Sprintf("'{{(index (index .NetworkSettings.Ports \"%d/tcp\") 0).HostPort}}'", contPort), ociID))
+		if err != nil {
+
+			// Error: "Template parsing error: template: :1:3: executing "" at <index (index .NetworkSettings.Ports "22/tcp") 0>: error calling index: index of untyped nil"
+			if strings.Contains(rr.Output(), `<index (index .NetworkSettings.Ports "22/tcp") 0>: error calling index: index of untyped nil`) && contPort == constants.SSHPort {
+				return 0, ErrGetSSHPortContainerNotRunning
+			}
+			if strings.Contains(rr.Output(), "error calling index: index of untyped nil") {
+				return 0, ErrGetPortContainerNotRunning
+			}
+			return 0, fmt.Errorf("get port %d for %q: %w", contPort, ociID, err)
+		}
+	}
+
+	o := strings.TrimSpace(rr.Stdout.String())
 	o = strings.Trim(o, "'")
 	p, err := strconv.Atoi(o)
 
 	if err != nil {
-		return p, errors.Wrapf(err, "convert host-port %q to number", p)
+		return p, fmt.Errorf("convert host-port %q to number: %w", o, err)
 	}
 
 	return p, nil
 }
 
 // ContainerIPs returns ipv4,ipv6, error of a container by their name
-func ContainerIPs(ociBinary string, name string) (string, string, error) {
-	if ociBinary == Podman {
-		return podmanConttainerIP(name)
+func ContainerIPs(ociBin string, name string) (string, string, error) {
+	if ociBin == Podman {
+		return podmanContainerIP(ociBin, name)
 	}
-	return dockerContainerIP(name)
+	return dockerContainerIP(ociBin, name)
 }
 
-// podmanConttainerIP returns ipv4, ipv6 of container or error
-func podmanConttainerIP(name string) (string, string, error) {
-	cmd := exec.Command(Podman, "inspect",
+// podmanContainerIP returns ipv4, ipv6 of container or error
+func podmanContainerIP(ociBin string, name string) (string, string, error) {
+	rr, err := runCmd(exec.Command(ociBin, "container", "inspect",
 		"-f", "{{.NetworkSettings.IPAddress}}",
-		name)
-	out, err := cmd.CombinedOutput()
+		name))
 	if err != nil {
-		return "", "", errors.Wrapf(err, "podman inspect ip %s", name)
+		return "", "", fmt.Errorf("podman inspect ip %s: %w", name, err)
 	}
-	output := strings.TrimSpace(string(out))
-	if err == nil && output == "" { // podman returns empty for 127.0.0.1
+	output := strings.TrimSpace(rr.Stdout.String())
+	if output == "" { // podman returns empty for 127.0.0.1
+		// check network, if the ip address is missing
+		ipv4, ipv6, err := dockerContainerIP(ociBin, name)
+		if err == nil {
+			return ipv4, ipv6, nil
+		}
 		return DefaultBindIPV4, "", nil
 	}
 	return output, "", nil
 }
 
 // dockerContainerIP returns ipv4, ipv6 of container or error
-func dockerContainerIP(name string) (string, string, error) {
+func dockerContainerIP(ociBin string, name string) (string, string, error) {
 	// retrieve the IP address of the node using docker inspect
-	lines, err := inspect(Docker, name, "{{range .NetworkSettings.Networks}}{{.IPAddress}},{{.GlobalIPv6Address}}{{end}}")
+	lines, err := inspect(ociBin, name, "{{range .NetworkSettings.Networks}}{{.IPAddress}},{{.GlobalIPv6Address}}{{end}}")
 	if err != nil {
-		return "", "", errors.Wrap(err, "inspecting NetworkSettings.Networks")
+		return "", "", fmt.Errorf("inspecting NetworkSettings.Networks: %w", err)
 	}
 
 	if len(lines) != 1 {
-		return "", "", errors.Errorf("IPs output should only be one line, got %d lines", len(lines))
+		return "", "", fmt.Errorf("IPs output should only be one line, got %d lines", len(lines))
 	}
 
 	ips := strings.Split(lines[0], ",")
 	if len(ips) != 2 {
-		return "", "", errors.Errorf("container addresses should have 2 values, got %d values: %+v", len(ips), ips)
+		return "", "", fmt.Errorf("container addresses should have 2 values, got %d values: %+v", len(ips), ips)
 	}
-
 	return ips[0], ips[1], nil
 }

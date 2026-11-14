@@ -13,7 +13,6 @@ The minikube [registry-creds addon](https://github.com/kubernetes/minikube/tree/
 
 The addon automagically refreshes the service account token for the `default` service account in the `default` namespace.
 
-
 ## Prerequisites
 
 - a working minikube cluster
@@ -21,13 +20,11 @@ The addon automagically refreshes the service account token for the `default` se
 - AWS access keys that can be used to pull the above image
 - AWS account number of the account hosting the registry
 
-
 ## Configuring and enabling the registry-creds addon
 
+### Configure the registry-creds addon
 
-### Configure the registry-creds addon 
-
-Configure the minikube registry-creds addon with the following command: 
+Configure the minikube registry-creds addon with the following command:
 
 Note: In this tutorial, we will focus only on the AWS ECR.
 
@@ -56,13 +53,17 @@ Do you want to enable Azure Container Registry? [y/n]: n
 
 ```
 
-### Enable the registry-creds addon 
+### Enable the registry-creds addon
 
-Enable the minikube registry-creds addon with the following command: 
+Enable the minikube registry-creds addon with the following command:
 
 ```shell
 minikube addons enable registry-creds
 ```
+
+The add-on will create secrets in each namespace other than `kube-system` that can be used for `imagePullSecrets` on a pod.  It also
+updates the `default` service account in each namespace to use these `imagePullSecrets`, which means any pod created outside
+the `kube-system` namespace without an explicit service account other than `default` will use the image pull secrets automatically.
 
 ### Create a deployment that uses an image in AWS ECR
 
@@ -116,22 +117,18 @@ Successfully pulled image "<<account_number>>.dkr.ecr.<<aws_region>>.amazonaws.c
 
 If you do not see that event, look at the troubleshooting section.
 
-
 ## Review
 
 In the above tutorial, we configured the `registry-creds` addon to refresh the credentials for AWS ECR so that we could pull private container images onto our minikube cluster. We ultimately created a deployment that used an image in a private AWS ECR repository.
-
 
 ## Troubleshooting
 
 - Check if you have a secret called `awsecr-cred` in the `default` namespace by running `kubectl get secrets`.
 - Check if the image path is valid.
 - Check if the registry-creds addon is enabled by using `minikube addons list`.
-
-## Caveats
-
-The service account token for the `default` service account in the `default` namespace is kept updated by the addon. If you create your deployment in a different namespace, the image pull will not work.
+- Check if you have specified `imagePullSecrets` on the workload or related service account if you're using a custom service account.
 
 ## Related articles
 
 - [registry-creds addon](https://github.com/kubernetes/minikube/tree/master/deploy/addons/registry-creds)
+- [registry-creds controller source](https://github.com/upmc-enterprises/registry-creds#registry-credentials)

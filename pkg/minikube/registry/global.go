@@ -17,11 +17,16 @@ limitations under the License.
 package registry
 
 import (
+	"cmp"
 	"fmt"
 	"os"
-	"sort"
+	"slices"
+	"sync"
+	"time"
 
-	"github.com/golang/glog"
+	"k8s.io/klog/v2"
+	"k8s.io/minikube/pkg/minikube/run"
+	"k8s.io/minikube/pkg/minikube/translate"
 )
 
 const (
@@ -35,7 +40,7 @@ const (
 	None = "none"
 )
 
-// IsKIC checks if the driver is a kubernetes in container
+// IsKIC checks if the driver is a Kubernetes in container
 func IsKIC(name string) bool {
 	return name == Docker || name == Podman
 }
@@ -65,16 +70,26 @@ var (
 
 // DriverState is metadata relating to a driver and status
 type DriverState struct {
-	Name     string
+	// Name is the name of the driver used internally
+	Name string
+	// Default drivers are selected automatically
+	Default bool
+	// Preference is the original priority from driver
+	Preference Priority
+	// Priority is the effective priority with health
 	Priority Priority
-	State    State
+	// State is the state of driver and dependencies
+	State State
 	// Rejection is why we chose not to use this driver
 	Rejection string
+	// Suggestion is how the user could improve health
+	Suggestion string
 }
 
 func (d DriverState) String() string {
 	if d.Priority == Experimental {
-		return fmt.Sprintf("%s (experimental)", d.Name)
+		experimental := translate.T("experimental")
+		return fmt.Sprintf("%s (%s)", d.Name, experimental)
 	}
 	return d.Name
 }
@@ -94,45 +109,66 @@ func Driver(name string) DriverDef {
 	return globalRegistry.Driver(name)
 }
 
-// Available returns a list of available drivers in the global registry
-func Available(vm bool) []DriverState {
-	sts := []DriverState{}
-	glog.Infof("Querying for installed drivers using PATH=%s", os.Getenv("PATH"))
+// Available returns a list of available drivers in the global registry.
+// Drivers are probed in parallel (one goroutine each), so wall-clock time is
+// about the slowest Status check, not the sum of all checks. Each driver's
+// status is responsible for respecting DriverDef.ProbeTimeout.
+func Available(vm bool, options *run.CommandOptions) []DriverState {
+	klog.Infof("Querying for installed drivers using PATH=%s", os.Getenv("PATH"))
 
-	for _, d := range globalRegistry.List() {
-		if d.Status == nil {
-			glog.Errorf("%q does not implement Status", d.Name)
+	type probeResult struct {
+		driver DriverDef
+		state  State
+	}
+
+	drivers := globalRegistry.List()
+	results := make(chan probeResult, len(drivers))
+	var wg sync.WaitGroup
+
+	for _, d := range drivers {
+		if vm && !IsVM(d.Name) {
 			continue
 		}
-		s := d.Status()
-		glog.Infof("%s priority: %d, state: %+v", d.Name, d.Priority, s)
+		if d.Status == nil {
+			klog.Errorf("%q does not implement Status", d.Name)
+			continue
+		}
+		wg.Go(func() {
+			start := time.Now()
+			s := d.Status(options)
+			klog.Infof("%s probed in %v: default: %v priority: %d, state: %+v", d.Name, time.Since(start), d.Default, d.Priority, s)
+			results <- probeResult{driver: d, state: s}
+		})
+	}
 
+	wg.Wait()
+	close(results)
+
+	sts := make([]DriverState, 0, len(drivers))
+	for r := range results {
+		s := r.state
+		d := r.driver
+
+		preference := d.Priority
 		priority := d.Priority
 		if !s.Healthy {
 			priority = Unhealthy
 		}
-
-		if vm {
-			if IsVM(d.Name) {
-				sts = append(sts, DriverState{Name: d.Name, Priority: priority, State: s})
-			}
-		} else {
-			sts = append(sts, DriverState{Name: d.Name, Priority: priority, State: s})
-		}
+		sts = append(sts, DriverState{Name: d.Name, Default: d.Default, Preference: preference, Priority: priority, State: s})
 	}
 
 	// Descending priority for predictability
-	sort.Slice(sts, func(i, j int) bool {
-		return sts[i].Priority > sts[j].Priority
+	slices.SortFunc(sts, func(a, b DriverState) int {
+		return cmp.Compare(b.Priority, a.Priority)
 	})
 	return sts
 }
 
 // Status returns the state of a driver within the global registry
-func Status(name string) State {
+func Status(name string, options *run.CommandOptions) State {
 	d := globalRegistry.Driver(name)
 	if d.Empty() {
 		return State{}
 	}
-	return d.Status()
+	return d.Status(options)
 }

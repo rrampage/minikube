@@ -19,6 +19,7 @@ package cmd
 import (
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"os"
 
@@ -31,12 +32,20 @@ var rootCmd = &cobra.Command{
 	Short:         "mkcmp is used to compare performance of two minikube binaries",
 	SilenceUsage:  true,
 	SilenceErrors: true,
-	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+	PersistentPreRunE: func(_ *cobra.Command, args []string) error {
 		return validateArgs(args)
 	},
-	RunE: func(cmd *cobra.Command, args []string) error {
-		return perf.CompareMinikubeStart(context.Background(), os.Stdout, args)
+	RunE: func(_ *cobra.Command, args []string) error {
+		binaries, err := retrieveBinaries(args)
+		if err != nil {
+			return err
+		}
+		return perf.CompareMinikubeStart(context.Background(), binaries)
 	},
+}
+
+func init() {
+	flag.Parse()
 }
 
 func validateArgs(args []string) error {
@@ -44,6 +53,18 @@ func validateArgs(args []string) error {
 		return errors.New("mkcmp requires two minikube binaries to compare: mkcmp [path to first binary] [path to second binary]")
 	}
 	return nil
+}
+
+func retrieveBinaries(args []string) ([]*perf.Binary, error) {
+	binaries := []*perf.Binary{}
+	for _, a := range args {
+		binary, err := perf.NewBinary(a)
+		if err != nil {
+			return nil, err
+		}
+		binaries = append(binaries, binary)
+	}
+	return binaries, nil
 }
 
 // Execute runs the mkcmp command

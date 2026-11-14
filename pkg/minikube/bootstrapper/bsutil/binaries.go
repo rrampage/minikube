@@ -24,25 +24,33 @@ import (
 	"runtime"
 	"strings"
 
-	"github.com/golang/glog"
-	"github.com/pkg/errors"
+	"github.com/spf13/viper"
 	"golang.org/x/sync/errgroup"
+
+	"k8s.io/klog/v2"
+	"k8s.io/minikube/pkg/minikube/assets"
 	"k8s.io/minikube/pkg/minikube/command"
 	"k8s.io/minikube/pkg/minikube/config"
 	"k8s.io/minikube/pkg/minikube/constants"
 	"k8s.io/minikube/pkg/minikube/download"
-	"k8s.io/minikube/pkg/minikube/machine"
+	"k8s.io/minikube/pkg/minikube/sysinit"
 	"k8s.io/minikube/pkg/minikube/vmpath"
 )
 
 // TransferBinaries transfers all required Kubernetes binaries
-func TransferBinaries(cfg config.KubernetesConfig, c command.Runner) error {
-	ok, err := binariesExist(cfg, c)
-	if err == nil && ok {
-		glog.Info("Found k8s binaries, skipping transfer")
+func TransferBinaries(cfg config.KubernetesConfig, c command.Runner, sm sysinit.Manager, binariesURL string) error {
+	// Skip binary transfer in --no-kubernetes mode
+	if viper.GetBool("no-kubernetes") {
+		klog.Info("Skipping Kubernetes binary transfer due to --no-kubernetes flag")
 		return nil
 	}
-	glog.Infof("Didn't find k8s binaries: %v\nInitiating transfer...", err)
+
+	ok, err := binariesExist(cfg, c)
+	if err == nil && ok {
+		klog.Info("Found k8s binaries, skipping transfer")
+		return nil
+	}
+	klog.Infof("Didn't find k8s binaries: %v\nInitiating transfer...", err)
 
 	dir := binRoot(cfg.KubernetesVersion)
 	_, err = c.RunCmd(exec.Command("sudo", "mkdir", "-p", dir))
@@ -50,23 +58,23 @@ func TransferBinaries(cfg config.KubernetesConfig, c command.Runner) error {
 		return err
 	}
 
-	// stop kubelet to avoid "Text File Busy" error
-	if _, err := c.RunCmd(exec.Command("/bin/bash", "-c", "pgrep kubelet && sudo systemctl stop kubelet")); err != nil {
-		glog.Warningf("unable to stop kubelet: %s", err)
-	}
-
 	var g errgroup.Group
 	for _, name := range constants.KubernetesReleaseBinaries {
-		name := name
 		g.Go(func() error {
-			src, err := download.Binary(name, cfg.KubernetesVersion, "linux", runtime.GOARCH)
+			src, err := download.Binary(name, cfg.KubernetesVersion, "linux", runtime.GOARCH, binariesURL)
 			if err != nil {
-				return errors.Wrapf(err, "downloading %s", name)
+				return fmt.Errorf("downloading %s: %w", name, err)
+			}
+
+			if name == "kubelet" && sm.Active(name) {
+				if err := sm.ForceStop(name); err != nil {
+					klog.Errorf("unable to stop kubelet: %v", err)
+				}
 			}
 
 			dst := path.Join(dir, name)
-			if err := machine.CopyBinary(c, src, dst); err != nil {
-				return errors.Wrapf(err, "copybinary %s -> %s", src, dst)
+			if err := copyBinary(c, src, dst); err != nil {
+				return fmt.Errorf("copybinary %s -> %s: %w", src, dst, err)
 			}
 			return nil
 		})
@@ -78,12 +86,12 @@ func TransferBinaries(cfg config.KubernetesConfig, c command.Runner) error {
 func binariesExist(cfg config.KubernetesConfig, c command.Runner) (bool, error) {
 	dir := binRoot(cfg.KubernetesVersion)
 	rr, err := c.RunCmd(exec.Command("sudo", "ls", dir))
-	stdout := rr.Stdout.String()
 	if err != nil {
 		return false, err
 	}
+	stdout := rr.Stdout.String()
 	foundBinaries := map[string]struct{}{}
-	for _, binary := range strings.Split(stdout, "\n") {
+	for binary := range strings.SplitSeq(stdout, "\n") {
 		foundBinaries[binary] = struct{}{}
 	}
 	for _, name := range constants.KubernetesReleaseBinaries {
@@ -97,4 +105,22 @@ func binariesExist(cfg config.KubernetesConfig, c command.Runner) (bool, error) 
 // binRoot returns the persistent path binaries are stored in
 func binRoot(version string) string {
 	return path.Join(vmpath.GuestPersistentDir, "binaries", version)
+}
+
+// copyBinary copies a locally cached binary to the guest VM
+func copyBinary(cr command.Runner, src, dest string) error {
+	f, err := assets.NewFileAsset(src, path.Dir(dest), path.Base(dest), "0755")
+	if err != nil {
+		return fmt.Errorf("new file asset: %w", err)
+	}
+	defer func() {
+		if err := f.Close(); err != nil {
+			klog.Warningf("error closing the file %s: %v", f.GetSourcePath(), err)
+		}
+	}()
+
+	if err := cr.Copy(f); err != nil {
+		return fmt.Errorf("copy: %w", err)
+	}
+	return nil
 }

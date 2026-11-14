@@ -23,13 +23,14 @@ import (
 // supportedDrivers is a list of supported drivers on Linux.
 var supportedDrivers = []string{
 	VirtualBox,
-	Parallels,
-	VMwareFusion,
 	KVM2,
+	QEMU2,
+	QEMU,
 	VMware,
 	None,
 	Docker,
 	Podman,
+	SSH,
 }
 
 // VBoxManagePath returns the path to the VBoxManage command

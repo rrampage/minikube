@@ -19,7 +19,6 @@ package config
 import (
 	"bytes"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"reflect"
 	"testing"
@@ -144,9 +143,13 @@ func TestReadConfig(t *testing.T) {
 }
 
 func TestWriteConfig(t *testing.T) {
-	configFile, err := ioutil.TempFile("/tmp", "configTest")
+	tmpDir := t.TempDir()
+	configFile, err := os.CreateTemp(tmpDir, "configTest")
 	if err != nil {
 		t.Fatalf("Error not expected but got %v", err)
+	}
+	if err := configFile.Close(); err != nil {
+		t.Fatalf("failed to close temp file: %v", err)
 	}
 
 	cfg := map[string]interface{}{
@@ -161,7 +164,6 @@ func TestWriteConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Error not expected but got %v", err)
 	}
-	defer os.Remove(configFile.Name())
 
 	mkConfig, err := ReadConfig(configFile.Name())
 	if err != nil {
@@ -186,5 +188,59 @@ func TestEncode(t *testing.T) {
 			t.Errorf("Did not write config correctly, \n\n expected:\n %+v \n\n actual:\n %+v", tt.data, b.String())
 		}
 		b.Reset()
+	}
+}
+
+func TestMachineName(t *testing.T) {
+	testsCases := []struct {
+		ClusterConfig ClusterConfig
+		Want          string
+	}{
+		{
+			ClusterConfig: ClusterConfig{Name: "minikube",
+				Nodes: []Node{
+					{
+						Name:              "",
+						IP:                "172.17.0.3",
+						Port:              8443,
+						KubernetesVersion: "v1.19.2",
+						ControlPlane:      true,
+						Worker:            true,
+					},
+				},
+			},
+			Want: "minikube",
+		},
+
+		{
+			ClusterConfig: ClusterConfig{Name: "p2",
+				Nodes: []Node{
+					{
+						Name:              "",
+						IP:                "172.17.0.3",
+						Port:              8443,
+						KubernetesVersion: "v1.19.2",
+						ControlPlane:      true,
+						Worker:            true,
+					},
+					{
+						Name:              "m2",
+						IP:                "172.17.0.4",
+						Port:              0,
+						KubernetesVersion: "v1.19.2",
+						ControlPlane:      false,
+						Worker:            true,
+					},
+				},
+			},
+			Want: "p2-m2",
+		},
+	}
+
+	for _, tc := range testsCases {
+		got := MachineName(tc.ClusterConfig, tc.ClusterConfig.Nodes[len(tc.ClusterConfig.Nodes)-1])
+		if got != tc.Want {
+			t.Errorf("Expected MachineName to be %q but got %q", tc.Want, got)
+		}
 	}
 }

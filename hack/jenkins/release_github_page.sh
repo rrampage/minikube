@@ -14,15 +14,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# This script generates the Github Release page and uploads all the binaries/etc to that page
+# This script generates the GitHub Release page and uploads all the binaries/etc to that page
 # This is intended to be run on a new release tag in order to generate the github release page for that release
 
 # The script expects the following env variables:
 # VERSION_MAJOR: The major version of the tag to be released.
 # VERSION_MINOR: The minor version of the tag to be released.
 # VERSION_BUILD: The build version of the tag to be released.
-# ISO_SHA256: The sha 256 of the minikube-iso for the current release.
-# GITHUB_TOKEN: The Github API access token. Injected by the Jenkins credential provider.
+# ISO_SHA256_AMD64: The sha 256 of the amd64 minikube-iso for the current release.
+# ISO_SHA256_ARM64: The sha 256 of the arm64 minikube-iso for the current release.
+# GITHUB_TOKEN: The GitHub API access token. Injected by the Jenkins credential provider.
 
 set -eux -o pipefail
 readonly VERSION="${VERSION_MAJOR}.${VERSION_MINOR}.${VERSION_BUILD}"
@@ -35,12 +36,17 @@ readonly GITHUB_ORGANIZATION="kubernetes"
 readonly GITHUB_REPO="minikube"
 readonly PROJECT_NAME="${GITHUB_REPO}"
 
+# installing golang to install github-release
+./hack/jenkins/installers/check_install_golang.sh "/usr/local"
+# installing latest version of github-release
+#./hack/jenkins/installers/check_install_github_release.sh
+
 RELEASE_FLAGS=""
 if ! [[ ${VERSION_BUILD} =~ ^[0-9]+$ ]]; then
   RELEASE_FLAGS="-p"  # Pre-release
 fi
 
-RELEASE_NOTES=$(perl -e "\$p=0; while(<>) { if(/^## Version ${VERSION} -/) { \$p=1 } elsif (/^##/) { \$p=0 }; if (\$p) { print }}" < CHANGELOG.md)
+RELEASE_NOTES=$(perl -e "\$p=0; while(<>) { if(/^## Version ${VERSION} -/) { \$p=1 } elsif (/^## Version/) { \$p=0 }; if (\$p) { print }}" < CHANGELOG.md)
 if [[ "${RELEASE_NOTES}" = "" ]]; then
   RELEASE_NOTES="(missing for ${VERSION})"
 fi
@@ -55,9 +61,14 @@ ${RELEASE_NOTES}
 
 See [Getting Started](https://minikube.sigs.k8s.io/docs/start/)
 
-## ISO Checksum
+## Binary Checksums
 
-\`${ISO_SHA256}\`"
+$(cat binary_checksums.txt)
+
+## ISO Checksums
+
+amd64: \`${ISO_SHA256_AMD64}\`  
+arm64: \`${ISO_SHA256_ARM64}\`"
 
 # ================================================================================
 # Deleting release from github before creating new one
@@ -75,34 +86,13 @@ github-release -v release ${RELEASE_FLAGS} \
     --name "${TAGNAME}" \
     --description "${DESCRIPTION}"
 
-# Uploading the files into github
-FILES_TO_UPLOAD=(
-    'minikube-linux-amd64'
-    'minikube-linux-amd64.sha256'
-    'minikube-darwin-amd64'
-    'minikube-darwin-amd64.sha256'
-    'minikube-windows-amd64.exe'
-    'minikube-windows-amd64.exe.sha256'
-    'minikube-installer.exe'
-    "minikube_${DEB_VERSION}-0_amd64.deb"
-    "minikube-${RPM_VERSION}-0.x86_64.rpm"
-    'docker-machine-driver-kvm2'
-    'docker-machine-driver-kvm2.sha256'
-    'docker-machine-driver-hyperkit'
-    'docker-machine-driver-hyperkit.sha256'
-)
-
-# ISO files are special, as they are generated pre-release tagging
-ISO_FILES=("minikube-v${VERSION}.iso" "minikube-v${VERSION}.iso.sha256")
-for DOWNLOAD in "${ISO_FILES[@]}"
-do
-  gsutil cp "gs://${ISO_BUCKET}/${DOWNLOAD}" out/ \
-    && FILES_TO_UPLOAD+=("${DOWNLOAD}") \
-    || echo "${DOWNLOAD} was not generated for this release"
+# ISO files are built from a separate process, and may not be included in this release
+for path in $(gsutil ls "gs://${ISO_BUCKET}/minikube-v${VERSION}*" || true); do
+  gsutil cp "${path}" out/
 done
-
-for UPLOAD in "${FILES_TO_UPLOAD[@]}"
-do
+ 
+# Upload all end-user assets other than preload files, as they are release independent
+for file in $( find out \( -name "minikube[_-]*" -or -name "docker-machine-*" -or -name "kic*" -or -name "licenses.tar.gz" \) ); do
     n=0
     until [ $n -ge 5 ]
     do
@@ -110,8 +100,8 @@ do
           --user "${GITHUB_ORGANIZATION}" \
           --repo "${GITHUB_REPO}" \
           --tag "${TAGNAME}" \
-          --name "$UPLOAD" \
-          --file "out/$UPLOAD" && break
+          --name "$(basename ${file})" \
+          --file "${file}" && break
         n=$((n+1))
         sleep 15
     done

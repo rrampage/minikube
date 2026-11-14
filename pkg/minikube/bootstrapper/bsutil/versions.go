@@ -17,12 +17,10 @@ limitations under the License.
 package bsutil
 
 import (
-	"path"
 	"strings"
 
-	"github.com/blang/semver"
+	"github.com/blang/semver/v4"
 	"k8s.io/minikube/pkg/minikube/config"
-	"k8s.io/minikube/pkg/minikube/vmpath"
 	"k8s.io/minikube/pkg/util"
 )
 
@@ -39,73 +37,39 @@ func versionIsBetween(version, gte, lte semver.Version) bool {
 }
 
 var versionSpecificOpts = []config.VersionedExtraOption{
-	{
-		Option: config.ExtraOption{
-			Component: Kubelet,
-			Key:       "fail-swap-on",
-			Value:     "false",
-		},
-		GreaterThanOrEqual: semver.MustParse("1.8.0-alpha.0"),
-	},
-	// Kubeconfig args
-	config.NewUnversionedOption(Kubelet, "kubeconfig", "/etc/kubernetes/kubelet.conf"),
 	config.NewUnversionedOption(Kubelet, "bootstrap-kubeconfig", "/etc/kubernetes/bootstrap-kubelet.conf"),
-	{
-		Option: config.ExtraOption{
-			Component: Kubelet,
-			Key:       "require-kubeconfig",
-			Value:     "true",
-		},
-		LessThanOrEqual: semver.MustParse("1.9.10"),
-	},
-
-	// System pods args
-	config.NewUnversionedOption(Kubelet, "pod-manifest-path", vmpath.GuestManifestsDir),
-	{
-		Option: config.ExtraOption{
-			Component: Kubelet,
-			Key:       "allow-privileged",
-			Value:     "true",
-		},
-		LessThanOrEqual: semver.MustParse("1.15.0-alpha.3"),
-	},
-
-	// Kubelet config file
 	config.NewUnversionedOption(Kubelet, "config", "/var/lib/kubelet/config.yaml"),
-
-	// Network args
-	config.NewUnversionedOption(Kubelet, "cluster-domain", "cluster.local"),
-
-	// Auth args
-	config.NewUnversionedOption(Kubelet, "authorization-mode", "Webhook"),
-	config.NewUnversionedOption(Kubelet, "client-ca-file", path.Join(vmpath.GuestKubernetesCertsDir, "ca.crt")),
-
-	// Cgroup args
-	config.NewUnversionedOption(Kubelet, "cgroup-driver", "cgroupfs"),
+	config.NewUnversionedOption(Kubelet, "kubeconfig", "/etc/kubernetes/kubelet.conf"),
 	{
 		Option: config.ExtraOption{
 			Component: Apiserver,
 			Key:       "enable-admission-plugins",
-			Value:     strings.Join(util.DefaultLegacyAdmissionControllers, ","),
-		},
-		GreaterThanOrEqual: semver.MustParse("1.11.0-alpha.0"),
-		LessThanOrEqual:    semver.MustParse("1.13.1000"),
-	},
-	{
-		Option: config.ExtraOption{
-			Component: Apiserver,
-			Key:       "enable-admission-plugins",
-			Value:     strings.Join(util.DefaultV114AdmissionControllers, ","),
+			Value:     strings.Join(util.DefaultAdmissionControllers, ","),
 		},
 		GreaterThanOrEqual: semver.MustParse("1.14.0-alpha.0"),
 	},
-
 	{
 		Option: config.ExtraOption{
-			Component: Kubelet,
-			Key:       "cadvisor-port",
-			Value:     "0",
+			Component: ControllerManager,
+			Key:       "allocate-node-cidrs",
+			Value:     "true",
 		},
-		LessThanOrEqual: semver.MustParse("1.11.1000"),
+		GreaterThanOrEqual: semver.MustParse("1.14.0"),
+	},
+	{
+		Option: config.ExtraOption{
+			Component: ControllerManager,
+			Key:       "leader-elect",
+			Value:     "false",
+		},
+		GreaterThanOrEqual: semver.MustParse("1.14.0"),
+	},
+	{
+		Option: config.ExtraOption{
+			Component: Scheduler,
+			Key:       "leader-elect",
+			Value:     "false",
+		},
+		GreaterThanOrEqual: semver.MustParse("1.14.0"),
 	},
 }

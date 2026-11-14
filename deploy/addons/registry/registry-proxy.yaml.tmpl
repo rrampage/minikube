@@ -19,7 +19,7 @@ spec:
         addonmanager.kubernetes.io/mode: Reconcile
     spec:
       containers:
-      - image: gcr.io/google_containers/kube-registry-proxy:0.4
+      - image: {{.CustomRegistries.KubeRegistryProxy  | default .ImageRepository | default .Registries.KubeRegistryProxy }}{{.Images.KubeRegistryProxy}}
         imagePullPolicy: IfNotPresent
         name: registry-proxy
         ports:
@@ -28,6 +28,6 @@ spec:
           hostPort: 5000
         env:
         - name: REGISTRY_HOST
-          value: registry.kube-system.svc.cluster.local
+          value: registry.kube-system.svc.{{.NetworkInfo.DNSDomain}}
         - name: REGISTRY_PORT
           value: "80"

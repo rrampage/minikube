@@ -23,142 +23,239 @@ import (
 	"strconv"
 	"strings"
 
+	"k8s.io/minikube/cmd/minikube/cmd/flags"
+	"k8s.io/minikube/pkg/minikube/cluster"
 	"k8s.io/minikube/pkg/minikube/config"
-	"k8s.io/minikube/pkg/minikube/driver"
+	"k8s.io/minikube/pkg/minikube/constants"
 	"k8s.io/minikube/pkg/minikube/exit"
 	"k8s.io/minikube/pkg/minikube/machine"
+	"k8s.io/minikube/pkg/minikube/notify"
 	"k8s.io/minikube/pkg/minikube/out"
+	"k8s.io/minikube/pkg/minikube/reason"
+	"k8s.io/minikube/pkg/minikube/run"
+	"k8s.io/minikube/pkg/minikube/style"
 
-	"github.com/golang/glog"
 	"github.com/olekukonko/tablewriter"
+	"github.com/olekukonko/tablewriter/tw"
 	"github.com/spf13/cobra"
+	"k8s.io/minikube/pkg/libmachine"
+
+	"k8s.io/klog/v2"
 )
 
 var (
-	output string
+	profileOutput string
+	isLight       bool
+	isDetailed    bool
 )
 
 var profileListCmd = &cobra.Command{
 	Use:   "list",
 	Short: "Lists all minikube profiles.",
 	Long:  "Lists all valid minikube profiles and detects all possible invalid profiles.",
-	Run: func(cmd *cobra.Command, args []string) {
+	Run: func(_ *cobra.Command, _ []string) {
+		options := flags.CommandOptions()
+		output := strings.ToLower(profileOutput)
+		out.SetJSON(output == "json")
+		go notify.MaybePrintUpdateTextFromGithub(options)
 
-		switch strings.ToLower(output) {
+		switch output {
 		case "json":
-			printProfilesJSON()
+			printProfilesJSON(options)
 		case "table":
-			printProfilesTable()
+			printProfilesTable(options)
 		default:
-			exit.WithCodeT(exit.BadUsage, fmt.Sprintf("invalid output format: %s. Valid values: 'table', 'json'", output))
+			exit.Message(reason.Usage, fmt.Sprintf("invalid output format: %s. Valid values: 'table', 'json'", profileOutput))
 		}
-
 	},
 }
 
-var printProfilesTable = func() {
-
-	var validData [][]string
-	table := tablewriter.NewWriter(os.Stdout)
-	table.SetHeader([]string{"Profile", "VM Driver", "Runtime", "IP", "Port", "Version", "Status"})
-	table.SetAutoFormatHeaders(false)
-	table.SetBorders(tablewriter.Border{Left: true, Top: true, Right: true, Bottom: true})
-	table.SetCenterSeparator("|")
-	validProfiles, invalidProfiles, err := config.ListProfiles()
-
-	if len(validProfiles) == 0 || err != nil {
-		exit.UsageT("No minikube profile was found. You can create one using `minikube start`.")
-	}
-	api, err := machine.NewAPIClient()
-	if err != nil {
-		glog.Errorf("failed to get machine api client %v", err)
-	}
-	defer api.Close()
-
-	for _, p := range validProfiles {
-		cp, err := config.PrimaryControlPlane(p.Config)
-		if err != nil {
-			exit.WithError("error getting primary control plane", err)
-		}
-		p.Status, err = machine.Status(api, driver.MachineName(*p.Config, cp))
-		if err != nil {
-			glog.Warningf("error getting host status for %s: %v", p.Name, err)
-		}
-		validData = append(validData, []string{p.Name, p.Config.Driver, p.Config.KubernetesConfig.ContainerRuntime, cp.IP, strconv.Itoa(cp.Port), p.Config.KubernetesConfig.KubernetesVersion, p.Status})
+func listProfiles() (validProfiles, invalidProfiles []*config.Profile, err error) {
+	if isLight {
+		validProfiles, err = config.ListValidProfiles()
+	} else {
+		validProfiles, invalidProfiles, err = config.ListProfiles()
 	}
 
-	table.AppendBulk(validData)
-	table.Render()
-
-	if invalidProfiles != nil {
-		out.WarningT("Found {{.number}} invalid profile(s) ! ", out.V{"number": len(invalidProfiles)})
-		for _, p := range invalidProfiles {
-			out.ErrT(out.Empty, "\t "+p.Name)
-		}
-		out.ErrT(out.Tip, "You can delete them using the following command(s): ")
-		for _, p := range invalidProfiles {
-			out.Err(fmt.Sprintf("\t $ minikube delete -p %s \n", p.Name))
-		}
-
-	}
-
-	if err != nil {
-		glog.Warningf("error loading profiles: %v", err)
-	}
-
+	return validProfiles, invalidProfiles, err
 }
 
-var printProfilesJSON = func() {
-	api, err := machine.NewAPIClient()
+func printProfilesTable(options *run.CommandOptions) {
+	validProfiles, invalidProfiles, err := listProfiles()
+
 	if err != nil {
-		glog.Errorf("failed to get machine api client %v", err)
+		klog.Warningf("error loading profiles: %v", err)
+	}
+
+	if len(validProfiles) == 0 {
+		exit.Message(reason.UsageNoProfileRunning, "No minikube profile was found.")
+	}
+
+	updateProfilesStatus(validProfiles, options)
+	renderProfilesTable(profilesToTableData(validProfiles))
+	warnInvalidProfiles(invalidProfiles)
+}
+
+func updateProfilesStatus(profiles []*config.Profile, options *run.CommandOptions) {
+	if isLight {
+		for _, p := range profiles {
+			p.Status = "Skipped"
+		}
+		return
+	}
+
+	api, err := machine.NewAPIClient(options)
+	if err != nil {
+		klog.Errorf("failed to get machine api client %v", err)
 	}
 	defer api.Close()
 
-	validProfiles, invalidProfiles, err := config.ListProfiles()
-	for _, v := range validProfiles {
-		cp, err := config.PrimaryControlPlane(v.Config)
-		if err != nil {
-			exit.WithError("error getting primary control plane", err)
+	for _, p := range profiles {
+		p.Status = profileStatus(p, api).StatusName
+	}
+}
+
+func profileStatus(p *config.Profile, api libmachine.API) cluster.State {
+	cps := config.ControlPlanes(*p.Config)
+	if len(cps) == 0 {
+		exit.Message(reason.GuestCpConfig, "No control-plane nodes found.")
+	}
+	statuses, err := cluster.GetStatus(api, p.Config)
+	if err != nil {
+		klog.Errorf("error getting statuses: %v", err)
+		return cluster.State{
+			BaseState: cluster.BaseState{
+				Name:       "Unknown",
+				StatusCode: 520,
+			},
 		}
-		status, err := machine.Status(api, driver.MachineName(*v.Config, cp))
-		if err != nil {
-			glog.Warningf("error getting host status for %s: %v", v.Name, err)
+	}
+	clusterStatus := cluster.GetState(statuses, ClusterFlagValue(), p.Config)
+
+	return clusterStatus
+}
+
+func renderProfilesTable(ps [][]string) {
+	table := tablewriter.NewWriter(os.Stdout)
+	if isDetailed {
+		table.Header("Profile", "Driver", "Runtime", "IP", "Port", "Version",
+			"Status", "Nodes", "Active Profile", "Active Kubecontext")
+	} else {
+		table.Header("Profile", "Driver", "Runtime", "IP", "Version", "Status",
+			"Nodes", "Active Profile", "Active Kubecontext")
+	}
+	table.Options(
+		tablewriter.WithHeaderAutoFormat(tw.Off),
+	)
+	if err := table.Bulk(ps); err != nil {
+		klog.Error("Error while bulk render table: ", err)
+	}
+	if err := table.Render(); err != nil {
+		klog.Error("Error while rendering profile table: ", err)
+	}
+}
+
+func profilesToTableData(profiles []*config.Profile) [][]string {
+	var data [][]string
+	currentProfile := ClusterFlagValue()
+	for _, p := range profiles {
+		cpIP := p.Config.KubernetesConfig.APIServerHAVIP
+		cpPort := p.Config.APIServerPort
+		if !config.IsHA(*p.Config) {
+			cp, err := config.ControlPlane(*p.Config)
+			if err != nil {
+				exit.Error(reason.GuestCpConfig, "error getting control-plane node", err)
+			}
+			cpIP = cp.IP
+			cpPort = cp.Port
 		}
-		v.Status = status
+
+		k8sVersion := p.Config.KubernetesConfig.KubernetesVersion
+		if k8sVersion == constants.NoKubernetesVersion { // for --no-kubernetes flag
+			k8sVersion = "N/A"
+		}
+		var c, k string
+		if p.Name == currentProfile {
+			c = "*"
+		}
+		if p.ActiveKubeContext {
+			k = "*"
+		}
+
+		var row []string
+		if isDetailed {
+			row = []string{p.Name, p.Config.Driver, p.Config.KubernetesConfig.ContainerRuntime,
+				cpIP, strconv.Itoa(cpPort), k8sVersion, p.Status, strconv.Itoa(len(p.Config.Nodes)), c, k}
+		} else {
+			row = []string{p.Name, p.Config.Driver, p.Config.KubernetesConfig.ContainerRuntime,
+				cpIP, k8sVersion, p.Status, strconv.Itoa(len(p.Config.Nodes)), c, k}
+		}
+
+		// Colorize row based on status
+		switch p.Status {
+		case "Running", "OK", "Configured":
+			// Green
+			for i, val := range row {
+				row[i] = style.Green + val + style.Reset
+			}
+		case "Stopped", "Paused", "Skipped":
+			// No color (default/white)
+		default:
+			// Red for everything else (Error, Misconfigured, Warning, etc)
+			for i, val := range row {
+				row[i] = style.Red + val + style.Reset
+			}
+		}
+
+		data = append(data, row)
+	}
+	return data
+}
+
+func warnInvalidProfiles(invalidProfiles []*config.Profile) {
+	if invalidProfiles == nil {
+		return
 	}
 
-	var valid []*config.Profile
-	var invalid []*config.Profile
-
-	if validProfiles != nil {
-		valid = validProfiles
-	} else {
-		valid = []*config.Profile{}
+	out.WarningT("Found {{.number}} invalid profile(s) ! ", out.V{"number": len(invalidProfiles)})
+	for _, p := range invalidProfiles {
+		out.ErrT(style.Empty, "\t "+p.Name)
 	}
 
-	if invalidProfiles != nil {
-		invalid = invalidProfiles
-	} else {
-		invalid = []*config.Profile{}
+	out.ErrT(style.Tip, "You can delete them using the following command(s): ")
+	for _, p := range invalidProfiles {
+		out.Errf("\t $ minikube delete -p %s \n", p.Name)
 	}
+}
+
+func printProfilesJSON(options *run.CommandOptions) {
+	validProfiles, invalidProfiles, err := listProfiles()
+	updateProfilesStatus(validProfiles, options)
 
 	var body = map[string]interface{}{}
-
 	if err == nil || config.IsNotExist(err) {
-		body["valid"] = valid
-		body["invalid"] = invalid
+		body["valid"] = profilesOrDefault(validProfiles)
+		body["invalid"] = profilesOrDefault(invalidProfiles)
 		jsonString, _ := json.Marshal(body)
-		out.String(string(jsonString))
+		os.Stdout.Write(jsonString)
 	} else {
 		body["error"] = err
 		jsonString, _ := json.Marshal(body)
-		out.String(string(jsonString))
-		os.Exit(exit.Failure)
+		os.Stdout.Write(jsonString)
+		os.Exit(reason.ExGuestError)
 	}
 }
 
+func profilesOrDefault(profiles []*config.Profile) []*config.Profile {
+	if profiles != nil {
+		return profiles
+	}
+	return []*config.Profile{}
+}
+
 func init() {
-	profileListCmd.Flags().StringVarP(&output, "output", "o", "table", "The output format. One of 'json', 'table'")
+	profileListCmd.Flags().StringVarP(&profileOutput, "output", "o", "table", "The output format. One of 'json', 'table'")
+	profileListCmd.Flags().BoolVarP(&isLight, "light", "l", false, "If true, returns list of profiles faster by skipping validating the status of the cluster.")
+	profileListCmd.Flags().BoolVarP(&isDetailed, "detailed", "d", false, "If true, returns a detailed list of profiles.")
 	ProfileCmd.AddCommand(profileListCmd)
 }

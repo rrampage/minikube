@@ -1,4 +1,4 @@
-// +build darwin
+//go:build darwin
 
 /*
 Copyright 2018 The Kubernetes Authors All rights reserved.
@@ -21,23 +21,28 @@ package parallels
 import (
 	"fmt"
 	"os/exec"
+	"time"
 
-	parallels "github.com/Parallels/docker-machine-parallels"
-	"github.com/docker/machine/libmachine/drivers"
+	"k8s.io/minikube/pkg/libmachine/drivers"
+
+	"k8s.io/minikube/pkg/drivers/parallels"
 	"k8s.io/minikube/pkg/minikube/config"
 	"k8s.io/minikube/pkg/minikube/download"
 	"k8s.io/minikube/pkg/minikube/driver"
 	"k8s.io/minikube/pkg/minikube/localpath"
 	"k8s.io/minikube/pkg/minikube/registry"
+	"k8s.io/minikube/pkg/minikube/run"
 )
 
 func init() {
 	err := registry.Register(registry.DriverDef{
-		Name:     driver.Parallels,
-		Config:   configure,
-		Status:   status,
-		Priority: registry.Default,
-		Init:     func() drivers.Driver { return parallels.NewDriver("", "") },
+		Name:         driver.Parallels,
+		Config:       configure,
+		Status:       status,
+		Default:      true,
+		Priority:     registry.Deprecated,
+		Init:         func(_ *run.CommandOptions) drivers.Driver { return parallels.NewDriver("", "") },
+		ProbeTimeout: 1 * time.Second,
 	})
 	if err != nil {
 		panic(fmt.Sprintf("unable to register: %v", err))
@@ -46,7 +51,11 @@ func init() {
 }
 
 func configure(cfg config.ClusterConfig, n config.Node) (interface{}, error) {
-	d := parallels.NewDriver(driver.MachineName(cfg, n), localpath.MiniPath()).(*parallels.Driver)
+	drv := parallels.NewDriver(config.MachineName(cfg, n), localpath.MiniPath())
+	d, ok := drv.(*parallels.Driver)
+	if !ok {
+		return nil, fmt.Errorf("unexpected driver type %T", drv)
+	}
 	d.Boot2DockerURL = download.LocalISOResource(cfg.MinikubeISO)
 	d.Memory = cfg.Memory
 	d.CPU = cfg.CPUs
@@ -54,10 +63,10 @@ func configure(cfg config.ClusterConfig, n config.Node) (interface{}, error) {
 	return d, nil
 }
 
-func status() registry.State {
-	_, err := exec.LookPath("docker-machine-driver-parallels")
+func status(_ *run.CommandOptions) registry.State {
+	_, err := exec.LookPath("prlctl")
 	if err != nil {
-		return registry.State{Error: err, Fix: "Install docker-machine-driver-parallels", Doc: "https://minikube.sigs.k8s.io/docs/reference/drivers/parallels/"}
+		return registry.State{Error: err, Fix: "Install Parallels Desktop for Mac", Doc: "https://minikube.sigs.k8s.io/docs/drivers/parallels/"}
 	}
 	return registry.State{Installed: true, Healthy: true}
 }

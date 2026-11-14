@@ -18,32 +18,61 @@ package oci
 
 import (
 	"encoding/json"
+	"fmt"
 	"os/exec"
 	"strings"
 	"time"
 
-	"github.com/pkg/errors"
+	"k8s.io/klog/v2"
 )
 
 // SysInfo Info represents common system Information between docker and podman that minikube cares
 type SysInfo struct {
-	CPUs        int   // CPUs is Number of CPUs
-	TotalMemory int64 // TotalMemory Total available ram
+	CPUs          int      // CPUs is Number of CPUs
+	TotalMemory   int64    // TotalMemory Total available ram
+	OSType        string   // container's OsType (windows or linux)
+	Swarm         bool     // Weather or not the docker swarm is active
+	Rootless      bool     // Weather or not the docker is running on rootless mode
+	StorageDriver string   // the storage driver for the daemon  (for example overlay2)
+	Errors        []string // any server issues
+	DockerOS      string   // used to detect if using Docker Desktop or Docker Engine on Linux
+}
+
+var (
+	cachedSysInfo    *SysInfo
+	cachedSysInfoErr *error
+)
+
+// CachedDaemonInfo will run and return a docker/podman info only once per minikube run time. to avoid performance
+var CachedDaemonInfo = func(ociBin string) (SysInfo, error) {
+	if cachedSysInfo == nil {
+		si, err := DaemonInfo(ociBin)
+		cachedSysInfo = &si
+		cachedSysInfoErr = &err
+	}
+	if cachedSysInfoErr == nil {
+		return *cachedSysInfo, nil
+	}
+	return *cachedSysInfo, *cachedSysInfoErr
 }
 
 // DaemonInfo returns common docker/podman daemon system info that minikube cares about
 func DaemonInfo(ociBin string) (SysInfo, error) {
-	var info SysInfo
 	if ociBin == Podman {
 		p, err := podmanSystemInfo()
-		info.CPUs = p.Host.Cpus
-		info.TotalMemory = p.Host.MemTotal
-		return info, err
+		cachedSysInfo = &SysInfo{CPUs: p.Host.Cpus, TotalMemory: p.Host.MemTotal, OSType: p.Host.Os, Swarm: false, Rootless: p.Host.Security.Rootless, StorageDriver: p.Store.GraphDriverName}
+		return *cachedSysInfo, err
 	}
 	d, err := dockerSystemInfo()
-	info.CPUs = d.NCPU
-	info.TotalMemory = d.MemTotal
-	return info, err
+	rootless := false
+	for _, se := range d.SecurityOptions {
+		if strings.HasPrefix(se, "name=rootless") {
+			rootless = true
+			break
+		}
+	}
+	cachedSysInfo = &SysInfo{CPUs: d.NCPU, TotalMemory: d.MemTotal, OSType: d.OSType, Swarm: d.Swarm.LocalNodeState == "active", Rootless: rootless, StorageDriver: d.Driver, Errors: d.ServerErrors, DockerOS: d.OperatingSystem}
+	return *cachedSysInfo, err
 }
 
 // dockerSysInfo represents the output of docker system info --format '{{json .}}'
@@ -147,6 +176,7 @@ type dockerSysInfo struct {
 	SecurityOptions []string    `json:"SecurityOptions"`
 	ProductLicense  string      `json:"ProductLicense"`
 	Warnings        interface{} `json:"Warnings"`
+	ServerErrors    []string
 	ClientInfo      struct {
 		Debug    bool          `json:"Debug"`
 		Plugins  []interface{} `json:"Plugins"`
@@ -184,8 +214,10 @@ type podmanSysInfo struct {
 		Hostname    string `json:"hostname"`
 		Kernel      string `json:"kernel"`
 		Os          string `json:"os"`
-		Rootless    bool   `json:"rootless"`
-		Uptime      string `json:"uptime"`
+		Security    struct {
+			Rootless bool `json:"rootless"`
+		} `json:"security"`
+		Uptime string `json:"uptime"`
 	} `json:"host"`
 	Registries struct {
 		Search []string `json:"search"`
@@ -213,34 +245,46 @@ type podmanSysInfo struct {
 	} `json:"store"`
 }
 
+var dockerInfoGetter = func() (string, error) {
+	rr, err := runCmd(exec.Command(Docker, "system", "info", "--format", "{{json .}}"))
+	return rr.Stdout.String(), err
+}
+
 // dockerSystemInfo returns docker system info --format '{{json .}}'
 func dockerSystemInfo() (dockerSysInfo, error) {
 	var ds dockerSysInfo
-
-	cmd := exec.Command(Docker, "system", "info", "--format", "{{json .}}")
-	out, err := cmd.CombinedOutput()
-
+	rawJSON, err := dockerInfoGetter()
 	if err != nil {
-		return ds, errors.Wrap(err, "get docker system info")
+		klog.Warningf("docker info: %v", err)
+		return ds, fmt.Errorf("docker system info: %w", err)
+	}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(rawJSON)), &ds); err != nil {
+		klog.Warningf("unmarshal docker info: %v", err)
+		return ds, fmt.Errorf("unmarshal docker system info: %w", err)
 	}
 
-	if err := json.Unmarshal([]byte(strings.TrimSpace(string(out))), &ds); err != nil {
-		return ds, errors.Wrapf(err, "unmarshal docker system info")
-	}
-
+	klog.Infof("docker info: %+v", ds)
 	return ds, nil
 }
 
-// podmanSysInfo returns podman system info --format '{{json .}}'
+var podmanInfoGetter = func() (string, error) {
+	rr, err := runCmd(exec.Command(Podman, "system", "info", "--format", "json"))
+	return rr.Stdout.String(), err
+}
+
+// podmanSystemInfo returns podman system info --format '{{json .}}'
 func podmanSystemInfo() (podmanSysInfo, error) {
 	var ps podmanSysInfo
-	cmd := exec.Command(Podman, "system", "info", "--format", "'{{json .}}'")
-	out, err := cmd.CombinedOutput()
+	rawJSON, err := podmanInfoGetter()
 	if err != nil {
-		return ps, errors.Wrap(err, "get podman system info")
+		klog.Warningf("podman info: %v", err)
+		return ps, fmt.Errorf("podman system info: %w", err)
 	}
-	if err := json.Unmarshal([]byte(strings.TrimSpace(string(out))), &ps); err != nil {
-		return ps, errors.Wrapf(err, "unmarshal podman system info")
+
+	if err := json.Unmarshal([]byte(strings.TrimSpace(rawJSON)), &ps); err != nil {
+		klog.Warningf("unmarshal podman info: %v", err)
+		return ps, fmt.Errorf("unmarshal podman system info: %w", err)
 	}
+	klog.Infof("podman info: %+v", ps)
 	return ps, nil
 }

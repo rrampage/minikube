@@ -20,12 +20,20 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
+	"regexp"
+	"slices"
 	"strings"
 
-	"github.com/golang/glog"
-	"github.com/pkg/errors"
+	"errors"
+
+	utilnet "k8s.io/apimachinery/pkg/util/net"
 	"k8s.io/client-go/rest"
+	"k8s.io/klog/v2"
+	"k8s.io/minikube/pkg/minikube/config"
+	"k8s.io/minikube/pkg/minikube/out"
+	"k8s.io/minikube/pkg/util"
 )
 
 // EnvVars are variables we plumb through to the underlying container runtime
@@ -34,25 +42,34 @@ var EnvVars = []string{"HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "h
 // isInBlock checks if ip is a CIDR block
 func isInBlock(ip string, block string) (bool, error) {
 	if ip == "" {
-		return false, fmt.Errorf("ip is nil")
+		return false, errors.New("ip is nil")
 	}
 	if block == "" {
-		return false, fmt.Errorf("CIDR is nil")
+		return false, errors.New("CIDR is nil")
+	}
+
+	if ip == block {
+		return true, nil
 	}
 
 	i := net.ParseIP(ip)
 	if i == nil {
-		return false, fmt.Errorf("parsed IP is nil")
-	}
-	_, b, err := net.ParseCIDR(block)
-	if err != nil {
-		return false, errors.Wrapf(err, "Error Parsing block %s", b)
+		return false, errors.New("parsed IP is nil")
 	}
 
-	if b.Contains(i) {
-		return true, nil
+	// check the block if it's CIDR
+	if strings.Contains(block, "/") {
+		_, b, err := net.ParseCIDR(block)
+		if err != nil {
+			return false, fmt.Errorf("Error Parsing block %s: %w", b, err)
+		}
+
+		if b.Contains(i) {
+			return true, nil
+		}
 	}
-	return false, errors.Wrapf(err, "Error ip not in block")
+
+	return false, errors.New("Error ip not in block")
 }
 
 // ExcludeIP takes ip or CIDR as string and excludes it from the http(s)_proxy
@@ -99,9 +116,13 @@ func checkEnv(ip string, env string) bool {
 		return true
 	}
 	// Checks if included in IP ranges, i.e., 192.168.39.13/24
-	noProxyBlocks := strings.Split(v, ",")
-	for _, b := range noProxyBlocks {
-		if yes, _ := isInBlock(ip, b); yes {
+	noProxyBlocks := strings.SplitSeq(v, ",")
+	for b := range noProxyBlocks {
+		yes, err := isInBlock(ip, b)
+		if err != nil {
+			klog.Warningf("fail to check proxy env: %v", err)
+		}
+		if yes {
 			return true
 		}
 	}
@@ -111,12 +132,7 @@ func checkEnv(ip string, env string) bool {
 
 // isValidEnv checks if the env for proxy settings
 func isValidEnv(env string) bool {
-	for _, e := range EnvVars {
-		if e == env {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(EnvVars, env)
 }
 
 // UpdateTransport takes a k8s client *rest.config and returns a config without a proxy.
@@ -126,13 +142,104 @@ func UpdateTransport(cfg *rest.Config) *rest.Config {
 		if wt != nil {
 			rt = wt(rt)
 		}
-		if ht, ok := rt.(*http.Transport); ok {
-			ht.Proxy = nil
-			rt = ht
-		} else {
-			glog.Errorf("Error while casting RoundTripper (of type %T) to *http.Transport : %v", rt, ok)
+		if t := wrappedHTTPTransport(rt); t != nil {
+			t.Proxy = nil
+		} else if rt != nil {
+			klog.Errorf("transport %T could not be unwrapped to *http.Transport; proxy stripping was skipped", rt)
 		}
 		return rt
 	}
 	return cfg
+}
+
+// wrappedHTTPTransport returns the *http.Transport at the bottom of any
+// RoundTripperWrapper chain wrapping rt, or nil if the chain does not end
+// in one (or rt itself is nil). See
+// https://github.com/kubernetes/minikube/issues/22896 for context.
+func wrappedHTTPTransport(rt http.RoundTripper) *http.Transport {
+	cur := rt
+	for {
+		switch t := cur.(type) {
+		case *http.Transport:
+			return t
+		case utilnet.RoundTripperWrapper:
+			cur = t.WrappedRoundTripper()
+		default:
+			return nil
+		}
+	}
+}
+
+// SetDockerEnv sets the proxy environment variables in the docker environment.
+func SetDockerEnv() []string {
+	for _, k := range EnvVars {
+		if v := os.Getenv(k); v != "" {
+			// convert https_proxy to HTTPS_PROXY for linux
+			// TODO (@medyagh): if user has both http_proxy & HTTPS_PROXY set merge them.
+			k = strings.ToUpper(k)
+			if k == "HTTP_PROXY" || k == "HTTPS_PROXY" {
+				isLocalProxy := func(u string) bool {
+					return strings.HasPrefix(u, "localhost") || strings.HasPrefix(u, "127.0")
+				}
+
+				normalizedURL := v
+				if !strings.Contains(v, "://") {
+					normalizedURL = "http://" + v // by default, assumes the url is HTTP scheme
+				}
+				u, err := url.Parse(normalizedURL)
+				if err != nil {
+					out.WarningT("Error parsing {{.name}}={{.value}}, {{.err}}", out.V{"name": k, "value": v, "err": err})
+					continue
+				}
+
+				if isLocalProxy(u.Host) {
+					out.WarningT("Local proxy ignored: not passing {{.name}}={{.value}} to docker env.", out.V{"name": k, "value": v})
+					continue
+				}
+			}
+			config.DockerEnv = append(config.DockerEnv, fmt.Sprintf("%s=%s", k, v))
+		}
+	}
+
+	config.DockerEnv = util.RemoveDuplicateStrings(config.DockerEnv)
+
+	return config.DockerEnv
+}
+
+// MaskProxyPassword masks the password in a proxy URL
+func MaskProxyPassword(proxyURL string) string {
+	// Proxy variable values SHOULD have a value like
+	// https(s)://<whatever>
+	parts := strings.Split(proxyURL, "://")
+	if len(parts) == 2 {
+		proxyAddress := parts[1]
+		// Let's store the username, the URL and an optional port address
+		pattern := `([^:]+):.+(@[\w\.\$\-\+\*\'\(\)]+)(:\d+)?`
+		re := regexp.MustCompile(pattern)
+		matches := re.FindStringSubmatch(proxyAddress)
+		mask := "*****"
+		switch len(matches) {
+		case 4:
+			return fmt.Sprintf("%s://%s:%s%s%s", parts[0], matches[1], mask, matches[2], matches[3])
+		case 3:
+			return fmt.Sprintf("%s//%s:%s@%s", parts[0], matches[1], mask, matches[2])
+		}
+	}
+	return proxyURL
+}
+
+// MaskProxyPasswordWithKey masks the password in a proxy URL specified by a key-value pair
+func MaskProxyPasswordWithKey(v string) string {
+	parts := strings.Split(v, "=")
+	// Is it an attribution variable?
+	if len(parts) == 2 {
+		key := strings.ToUpper(parts[0])
+		// Is it a proxy setting?
+		if key == "HTTP_PROXY" || key == "HTTPS_PROXY" {
+			proxyValue := parts[1]
+			maskedProxyValue := MaskProxyPassword(proxyValue)
+			return key + "=" + maskedProxyValue
+		}
+	}
+	return v
 }

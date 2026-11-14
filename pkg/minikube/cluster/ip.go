@@ -20,75 +20,142 @@ import (
 	"fmt"
 	"net"
 	"os/exec"
+	"reflect"
 	"regexp"
+	"strings"
 
-	"github.com/docker/machine/libmachine"
-	"github.com/docker/machine/libmachine/host"
-	"github.com/pkg/errors"
+	"errors"
+
+	"k8s.io/klog/v2"
 	"k8s.io/minikube/pkg/drivers/kic/oci"
+	"k8s.io/minikube/pkg/drivers/virtualbox"
+	"k8s.io/minikube/pkg/libmachine"
+	"k8s.io/minikube/pkg/libmachine/host"
 	"k8s.io/minikube/pkg/minikube/driver"
 	"k8s.io/minikube/pkg/minikube/machine"
 )
 
-// GetVMHostIP gets the ip address to be used for mapping host -> VM and VM -> host
-func GetVMHostIP(host *host.Host) (net.IP, error) {
-	switch host.DriverName {
+// HostIP gets the ip address to be used for mapping host -> VM and VM -> host
+func HostIP(hostInfo *host.Host, clusterName string) (net.IP, error) {
+	switch hostInfo.DriverName {
 	case driver.Docker:
-		return oci.RoutableHostIPFromInside(oci.Docker, host.Name)
+		return oci.RoutableHostIPFromInside(oci.Docker, clusterName, hostInfo.Name)
 	case driver.Podman:
-		return oci.RoutableHostIPFromInside(oci.Podman, host.Name)
+		return oci.RoutableHostIPFromInside(oci.Podman, clusterName, hostInfo.Name)
+	case driver.SSH:
+		ip, err := hostInfo.Driver.GetIP()
+		if err != nil {
+			return []byte{}, fmt.Errorf("Error getting VM/Host IP address: %w", err)
+		}
+		return net.ParseIP(ip), nil
 	case driver.KVM2:
-		return net.ParseIP("192.168.39.1"), nil
-	case driver.HyperV:
-		re := regexp.MustCompile(`"VSwitch": "(.*?)",`)
-		// TODO(aprindle) Change this to deserialize the driver instead
-		hypervVirtualSwitch := re.FindStringSubmatch(string(host.RawDriver))[1]
-		ip, err := getIPForInterface(fmt.Sprintf("vEthernet (%s)", hypervVirtualSwitch))
+		// `host.Driver.GetIP` returns dhcp lease info for a given network(=`virsh net-dhcp-leases minikube-net`)
+		vmIPString, err := hostInfo.Driver.GetIP()
 		if err != nil {
-			return []byte{}, errors.Wrap(err, fmt.Sprintf("ip for interface (%s)", hypervVirtualSwitch))
-		}
-		return ip, nil
-	case driver.VirtualBox:
-		out, err := exec.Command(driver.VBoxManagePath(), "showvminfo", host.Name, "--machinereadable").Output()
-		if err != nil {
-			return []byte{}, errors.Wrap(err, "vboxmanage")
-		}
-		re := regexp.MustCompile(`hostonlyadapter2="(.*?)"`)
-		iface := re.FindStringSubmatch(string(out))[1]
-		ip, err := getIPForInterface(iface)
-		if err != nil {
-			return []byte{}, errors.Wrap(err, "Error getting VM/Host IP address")
-		}
-		return ip, nil
-	case driver.HyperKit:
-		return net.ParseIP("192.168.64.1"), nil
-	case driver.VMware:
-		vmIPString, err := host.Driver.GetIP()
-		if err != nil {
-			return []byte{}, errors.Wrap(err, "Error getting VM IP address")
+			return []byte{}, fmt.Errorf("Error getting VM/Host IP address: %w", err)
 		}
 		vmIP := net.ParseIP(vmIPString).To4()
 		if vmIP == nil {
-			return []byte{}, errors.Wrap(err, "Error converting VM IP address to IPv4 address")
+			// We need the network ip address for minikube-net. It's the start address of the returned subnet.
+			return []byte{}, fmt.Errorf("Error converting VM/Host IP address to IPv4 address: %w", err)
 		}
 		return net.IPv4(vmIP[0], vmIP[1], vmIP[2], byte(1)), nil
+	case driver.QEMU, driver.QEMU2:
+		ipString, err := hostInfo.Driver.GetIP()
+		if err != nil {
+			return []byte{}, fmt.Errorf("Error getting IP address: %w", err)
+		}
+		if ipString == "127.0.0.1" {
+			// user network case
+			return net.ParseIP("10.0.2.2"), nil
+		}
+		// socket_vmnet network case
+		return net.ParseIP("192.168.105.1"), nil
+	case driver.HyperV:
+		v := reflect.ValueOf(hostInfo.Driver).Elem()
+		var hypervVirtualSwitch string
+		// We don't have direct access to hyperv.Driver so use reflection to retrieve the virtual switch name
+		for i := 0; i < v.NumField(); i++ {
+			if v.Type().Field(i).Name == "VSwitch" {
+				if val, ok := v.Field(i).Interface().(string); ok {
+					hypervVirtualSwitch = val
+				}
+
+				break
+			}
+		}
+		if hypervVirtualSwitch == "" {
+			return nil, errors.New("No virtual switch found")
+		}
+		ip, err := getIPForInterface(fmt.Sprintf("vEthernet (%s)", hypervVirtualSwitch))
+		if err != nil {
+			return []byte{}, fmt.Errorf("%s: %w", fmt.Sprintf("ip for interface (%s)", hypervVirtualSwitch), err)
+		}
+
+		return ip, nil
+	case driver.VirtualBox:
+		vbxDriver, ok := hostInfo.Driver.(*virtualbox.Driver)
+		if !ok {
+			return []byte{}, fmt.Errorf("unexpected driver type %T for virtualbox case", hostInfo.Driver)
+		}
+		return vbxDriver.HostInterfaceIP()
+	case driver.Parallels:
+		bin := "prlsrvctl"
+		var binPath string
+		if fullPath, err := exec.LookPath(bin); err != nil {
+			binPath = fullPath
+		} else {
+			binPath = bin
+		}
+		out, err := exec.Command(binPath, "net", "info", "Shared").Output()
+		if err != nil {
+			return []byte{}, fmt.Errorf("Error reading the info of Parallels Shared network interface: %w", err)
+		}
+		re := regexp.MustCompile(`IPv4 address: (.*)`)
+		ipMatch := re.FindStringSubmatch(string(out))
+		if len(ipMatch) < 2 {
+			return []byte{}, fmt.Errorf("Error getting the IP address of Parallels Shared network interface: %w", err)
+		}
+		ip := ipMatch[1]
+
+		return net.ParseIP(ip), nil
+	case driver.VFKit, driver.Krunkit:
+		// TODO: check why we need this and test with:
+		// - vfkkit+nat
+		// - vfkit+vmnet-shared
+		// - krunkit+vmnet-shared
+		vmIPString, _ := hostInfo.Driver.GetIP()
+		gatewayIPString := vmIPString[:strings.LastIndex(vmIPString, ".")+1] + "1"
+		return net.ParseIP(gatewayIPString), nil
+	case driver.VMware:
+		vmIPString, err := hostInfo.Driver.GetIP()
+		if err != nil {
+			return []byte{}, fmt.Errorf("Error getting VM IP address: %w", err)
+		}
+		vmIP := net.ParseIP(vmIPString).To4()
+		if vmIP == nil {
+			return []byte{}, fmt.Errorf("Error converting VM IP address to IPv4 address: %w", err)
+		}
+		return net.IPv4(vmIP[0], vmIP[1], vmIP[2], byte(1)), nil
+	case driver.None:
+		return net.ParseIP("127.0.0.1"), nil
 	default:
-		return []byte{}, errors.New("Error, attempted to get host ip address for unsupported driver")
+		return []byte{}, fmt.Errorf("HostIP not yet implemented for %q driver", hostInfo.DriverName)
 	}
 }
 
-// GetHostDriverIP gets the ip address of the current minikube cluster
-func GetHostDriverIP(api libmachine.API, machineName string) (net.IP, error) {
-	host, err := machine.LoadHost(api, machineName)
+// DriverIP gets the ip address of the current minikube cluster
+func DriverIP(api libmachine.API, machineName string) (net.IP, error) {
+	hostInfo, err := machine.LoadHost(api, machineName)
 	if err != nil {
 		return nil, err
 	}
 
-	ipStr, err := host.Driver.GetIP()
+	ipStr, err := hostInfo.Driver.GetIP()
 	if err != nil {
-		return nil, errors.Wrap(err, "getting IP")
+		return nil, fmt.Errorf("getting IP: %w", err)
 	}
-	if driver.IsKIC(host.DriverName) {
+	if driver.IsKIC(hostInfo.DriverName) {
 		ipStr = oci.DefaultBindIPV4
 	}
 	ip := net.ParseIP(ipStr)
@@ -100,14 +167,50 @@ func GetHostDriverIP(api libmachine.API, machineName string) (net.IP, error) {
 
 // Based on code from http://stackoverflow.com/questions/23529663/how-to-get-all-addresses-and-masks-from-local-interfaces-in-go
 func getIPForInterface(name string) (net.IP, error) {
-	i, _ := net.InterfaceByName(name)
+	klog.Infof("getIPForInterface: searching for %q", name)
+	ints, err := net.Interfaces()
+	if err != nil {
+		return nil, err
+	}
+
+	var i net.Interface
+	for _, in := range ints {
+		if strings.HasPrefix(strings.ToLower(in.Name), strings.ToLower(name)) {
+			klog.Infof("found prefix matching interface for %q: %q", name, in.Name)
+			i = in
+
+			break
+		}
+		klog.Infof("%q does not match prefix %q", in.Name, name)
+	}
+
+	// Didn't find prefix, let's try any substring
+	if i.Name == "" {
+		for _, in := range ints {
+			if strings.Contains(strings.ToLower(in.Name), strings.ToLower(name)) {
+				klog.Infof("found substring matching interface for %q: %q", name, in.Name)
+				i = in
+
+				break
+			}
+			klog.Infof("%q does not match substring %q", in.Name, name)
+		}
+	}
+
+	// We found nothing, fail out
+	if i.Name == "" {
+		return nil, fmt.Errorf("Could not find interface %s inside %+v", name, ints)
+	}
+
+	klog.Infof("Found interface: %+v\n", i)
 	addrs, _ := i.Addrs()
 	for _, a := range addrs {
+		klog.Infof("interface addr: %+v", a)
 		if ipnet, ok := a.(*net.IPNet); ok {
 			if ip := ipnet.IP.To4(); ip != nil {
 				return ip, nil
 			}
 		}
 	}
-	return nil, errors.Errorf("Error finding IPV4 address for %s", name)
+	return nil, fmt.Errorf("Unable to find a IPv4 address for interface %q", name)
 }

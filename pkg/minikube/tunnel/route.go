@@ -20,7 +20,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/golang/glog"
+	"k8s.io/klog/v2"
 )
 
 // router manages the routing table on the host, implementations should cater for OS specific methods
@@ -53,7 +53,7 @@ func isValidToAddOrDelete(router router, r *Route) (bool, error) {
 	}
 
 	if len(overlaps) > 0 {
-		glog.Warningf("overlapping CIDR detected in routing table with minikube tunnel (CIDR: %s). It is advisable to remove these rules:\n%v", r.DestCIDR, strings.Join(overlaps, "\n"))
+		klog.Warningf("overlapping CIDR detected in routing table with minikube tunnel (CIDR: %s). It is advisable to remove these rules:\n%v", r.DestCIDR, strings.Join(overlaps, "\n"))
 	}
 
 	if exists {
@@ -77,16 +77,17 @@ func (t *routingTable) Check(route *Route) (exists bool, conflict string, overla
 	overlaps = []string{}
 	for _, tableLine := range *t {
 
-		if route.Equal(tableLine.route) {
+		switch {
+		case route.Equal(tableLine.route):
 			exists = true
-		} else if route.DestCIDR.String() == tableLine.route.DestCIDR.String() &&
-			route.Gateway.String() != tableLine.route.Gateway.String() {
+		case route.DestCIDR.String() == tableLine.route.DestCIDR.String() &&
+			route.Gateway.String() != tableLine.route.Gateway.String():
 			conflict = tableLine.line
-		} else if route.DestCIDR.Contains(tableLine.route.DestCIDR.IP) || tableLine.route.DestCIDR.Contains(route.DestCIDR.IP) {
+		case route.DestCIDR.Contains(tableLine.route.DestCIDR.IP) || tableLine.route.DestCIDR.Contains(route.DestCIDR.IP):
 			overlaps = append(overlaps, tableLine.line)
 		}
 	}
-	return
+	return exists, conflict, overlaps
 }
 
 func (t *routingTable) String() string {
@@ -105,7 +106,7 @@ func (t *routingTable) Equal(other *routingTable) bool {
 	for i := range *t {
 		routesEqual := (*t)[i].route.Equal((*other)[i].route)
 		linesEqual := (*t)[i].line == ((*other)[i].line)
-		if !(routesEqual && linesEqual) {
+		if !routesEqual || !linesEqual {
 			return false
 		}
 	}

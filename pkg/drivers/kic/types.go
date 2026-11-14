@@ -23,29 +23,35 @@ import (
 )
 
 const (
-	// DefaultNetwork is the Docker default bridge network named "bridge"
-	// (https://docs.docker.com/network/bridge/#use-the-default-bridge-network)
-	DefaultNetwork = "bridge"
-	// DefaultPodCIDR is The CIDR to be used for pods inside the node.
-	DefaultPodCIDR = "10.244.0.0/16"
-
 	// Version is the current version of kic
-	Version = "v0.0.8"
-	// SHA of the kic base image
-	baseImageSHA = "2f3380ebf1bb0c75b0b47160fd4e61b7b8fef0f1f32f9def108d3eada50a7a81"
+	Version = "v0.0.51-1794391316-24028"
 
-	// OverlayImage is the cni plugin used for overlay image, created by kind.
-	// CNI plugin image used for kic drivers created by kind.
-	OverlayImage = "kindest/kindnetd:0.5.3"
+	// SHA of the kic base image
+	baseImageSHA = "08e052df8230c8ab920e51621e8a0b396c99f5eeb54cc0d7d0f725f5cdb148fc"
+	// The name of the GCR kicbase repository
+	gcrRepo = "docker.io/kicbase/build"
+	// The name of the Dockerhub kicbase repository
+	dockerhubRepo = "docker.io/kicbase/build"
 )
 
 var (
 	// BaseImage is the base image is used to spin up kic containers. it uses same base-image as kind.
-	BaseImage = fmt.Sprintf("gcr.io/k8s-minikube/kicbase:%s@sha256:%s", Version, baseImageSHA)
+	BaseImage = fmt.Sprintf("%s:%s@sha256:%s", gcrRepo, Version, baseImageSHA)
+
+	// FallbackImages are backup base images in case gcr isn't available
+	FallbackImages = []string{
+		// the fallback of BaseImage in case gcr.io is not available. stored in docker hub
+		// same image is push to https://github.com/kicbase/stable
+		fmt.Sprintf("%s:%s@sha256:%s", dockerhubRepo, Version, baseImageSHA),
+		// try without sha because #11068
+		fmt.Sprintf("%s:%s", gcrRepo, Version),
+		fmt.Sprintf("%s:%s", dockerhubRepo, Version),
+	}
 )
 
 // Config is configuration for the kic driver used by registry
 type Config struct {
+	ClusterName       string            // The cluster the container belongs to
 	MachineName       string            // maps to the container name being created
 	CPU               int               // Number of CPU cores assigned to the container
 	Memory            int               // max memory in MB
@@ -53,9 +59,15 @@ type Config struct {
 	OCIBinary         string            // oci tool to use (docker, podman,...)
 	ImageDigest       string            // image name with sha to use for the node
 	Mounts            []oci.Mount       // mounts
-	APIServerPort     int               // kubernetes api server port inside the container
+	APIServerPort     int               // Kubernetes api server port inside the container
 	PortMappings      []oci.PortMapping // container port mappings
 	Envs              map[string]string // key,value of environment variables passed to the node
-	KubernetesVersion string            // kubernetes version to install
+	KubernetesVersion string            // Kubernetes version to install
 	ContainerRuntime  string            // container runtime kic is running
+	Network           string            // network to run with kic
+	Subnet            string            // subnet to be used on kic cluster
+	StaticIP          string            // static IP for the kic cluster
+	ExtraArgs         []string          // a list of any extra option to pass to oci binary during creation time, for example --expose 8080...
+	ListenAddress     string            // IP Address to listen to
+	GPUs              string            // add GPU devices to the container
 }

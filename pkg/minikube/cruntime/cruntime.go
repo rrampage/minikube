@@ -20,14 +20,17 @@ package cruntime
 import (
 	"fmt"
 	"os/exec"
+	"strings"
 
-	"github.com/blang/semver"
-	"github.com/golang/glog"
-	"github.com/pkg/errors"
+	"errors"
+
+	"github.com/blang/semver/v4"
+	"k8s.io/klog/v2"
 	"k8s.io/minikube/pkg/minikube/assets"
 	"k8s.io/minikube/pkg/minikube/command"
 	"k8s.io/minikube/pkg/minikube/config"
-	"k8s.io/minikube/pkg/minikube/out"
+	"k8s.io/minikube/pkg/minikube/style"
+	"k8s.io/minikube/pkg/minikube/sysinit"
 )
 
 // ContainerState is the run state of a container
@@ -46,13 +49,30 @@ func (cs ContainerState) String() string {
 	return [...]string{"all", "running", "paused"}[cs]
 }
 
+// ValidRuntimes lists the supported container runtimes
+func ValidRuntimes() []string {
+	return []string{"docker", "cri-o", "containerd"}
+}
+
 // CommandRunner is the subset of command.Runner this package consumes
 type CommandRunner interface {
+	// RunCmd is a blocking method that runs a command
+	// Use this if you don't need to stream stdout and stderr in real-time
 	RunCmd(cmd *exec.Cmd) (*command.RunResult, error)
+	// StartCmd is a non-blocking method that starts a command
+	// Use WaitCmd to block until the command is complete
+	// Use this if you need to stream stdout and/or stderr in real-time
+	StartCmd(cmd *exec.Cmd) (*command.StartedCmd, error)
+	// WaitCmd blocks until the started command completes
+	WaitCmd(sc *command.StartedCmd) (*command.RunResult, error)
 	// Copy is a convenience method that runs a command to copy a file
 	Copy(assets.CopyableFile) error
+	// CopyFrom is a convenience method that runs a command to copy a file back
+	CopyFrom(assets.CopyableFile) error
 	// Remove is a convenience method that runs a command to remove a file
 	Remove(assets.CopyableFile) error
+
+	ReadableFile(sourcePath string) (assets.ReadableFile, error)
 }
 
 // Manager is a common interface for container runtimes
@@ -62,7 +82,7 @@ type Manager interface {
 	// Version retrieves the current version of this runtime
 	Version() (string, error)
 	// Enable idempotently enables this runtime on a host
-	Enable(bool) error
+	Enable(bool, string, bool) error
 	// Disable idempotently disables this runtime on a host
 	Disable() error
 	// Active returns whether or not a runtime is active on a host
@@ -70,7 +90,7 @@ type Manager interface {
 	// Available returns an error if it is not possible to use this runtime on a host
 	Available() error
 	// Style is an associated StyleEnum for Name()
-	Style() out.StyleEnum
+	Style() style.Enum
 
 	// CGroupDriver returns cgroup driver ("cgroupfs" or "systemd")
 	CGroupDriver() (string, error)
@@ -78,17 +98,30 @@ type Manager interface {
 	KubeletOptions() map[string]string
 	// SocketPath returns the path to the socket file for a given runtime
 	SocketPath() string
-	// DefaultCNI returns whether to use CNI networking by default
-	DefaultCNI() bool
 
 	// Load an image idempotently into the runtime on a host
 	LoadImage(string) error
+	// Pull an image to the runtime from the container registry
+	PullImage(string) error
+	// Build an image idempotently into the runtime on a host
+	BuildImage(string, string, string, bool, []string, []string) error
+	// Save an image from the runtime on a host
+	SaveImage(string, string) error
+	// Tag an image
+	TagImage(string, string) error
+	// Push an image from the runtime to the container registry
+	PushImage(string) error
 
-	// ImageExists takes image name and image sha checks if an it exists
+	// ImageExists takes image name and optionally image sha to check if an image exists
 	ImageExists(string, string) bool
+	// ListImages returns a list of images managed by this container runtime
+	ListImages(ListImagesOptions) ([]ListImage, error)
 
-	// ListContainers returns a list of managed by this container runtime
-	ListContainers(ListOptions) ([]string, error)
+	// RemoveImage remove image based on name
+	RemoveImage(string) error
+
+	// ListContainers returns a list of containers managed by this container runtime
+	ListContainers(ListContainersOptions) ([]string, error)
 	// KillContainers removes containers based on ID
 	KillContainers([]string) error
 	// StopContainers stops containers based on ID
@@ -102,7 +135,9 @@ type Manager interface {
 	// SystemLogCmd returns the command to return the system logs
 	SystemLogCmd(int) string
 	// Preload preloads the container runtime with k8s images
-	Preload(config.KubernetesConfig) error
+	Preload(config.ClusterConfig) error
+	// ImagesPreloaded returns true if all images have been preloaded
+	ImagesPreloaded([]string) bool
 }
 
 // Config is runtime configuration
@@ -113,14 +148,20 @@ type Config struct {
 	Socket string
 	// Runner is the CommandRunner object to execute commands with
 	Runner CommandRunner
+	// NetworkPlugin name of networking plugin ("cni")
+	NetworkPlugin string
 	// ImageRepository image repository to download image from
 	ImageRepository string
 	// KubernetesVersion Kubernetes version
 	KubernetesVersion semver.Version
+	// InsecureRegistry list of insecure registries
+	InsecureRegistry []string
+	// GPUs add GPU devices to the container
+	GPUs string
 }
 
-// ListOptions are the options to use for listing containers
-type ListOptions struct {
+// ListContainersOptions are the options to use for listing containers
+type ListContainersOptions struct {
 	// State is the container state to filter by (All, Running, Paused)
 	State ContainerState
 	// Name is a name filter
@@ -129,15 +170,89 @@ type ListOptions struct {
 	Namespaces []string
 }
 
+// ListImagesOptions are the options to use for listing images
+type ListImagesOptions struct {
+}
+
+type ListImage struct {
+	ID          string   `json:"id" yaml:"id"`
+	RepoDigests []string `json:"repoDigests" yaml:"repoDigests"`
+	RepoTags    []string `json:"repoTags" yaml:"repoTags"`
+	Size        string   `json:"size" yaml:"size"`
+}
+
+// ErrContainerRuntimeNotRunning is thrown when container runtime is not running
+var ErrContainerRuntimeNotRunning = errors.New("container runtime is not running")
+
+// ErrServiceVersion is the error returned when disk image has incompatible version of service
+type ErrServiceVersion struct {
+	// Service is the name of the incompatible service
+	Service string
+	// Installed is the installed version of Service
+	Installed string
+	// Required is the minimum required version of Service
+	Required string
+}
+
+// NewErrServiceVersion creates a new ErrServiceVersion
+func NewErrServiceVersion(svc, required, installed string) *ErrServiceVersion {
+	return &ErrServiceVersion{
+		Service:   svc,
+		Installed: installed,
+		Required:  required,
+	}
+}
+
+func (e ErrServiceVersion) Error() string {
+	return fmt.Sprintf("service %q version is %v. Required: %v",
+		e.Service, e.Installed, e.Required)
+}
+
 // New returns an appropriately configured runtime
 func New(c Config) (Manager, error) {
+	sm := sysinit.New(c.Runner)
+
 	switch c.Type {
+	// "" is docker: until c4800a611 (2022, "Make the default container runtime
+	// dynamic") start persisted the raw --container-runtime flag, whose default
+	// is "". Those profiles are docker. Later starts store a real name, so ""
+	// is not the current product default and must not become containerd.
 	case "", "docker":
-		return &Docker{Socket: c.Socket, Runner: c.Runner}, nil
+		sp := c.Socket
+		cs := ""
+		// There is no more dockershim socket, in Kubernetes version 1.24 and beyond
+		if sp == "" && c.KubernetesVersion.GTE(semver.MustParse("1.24.0-alpha.0")) {
+			sp = ExternalDockerCRISocket
+			cs = "cri-docker.socket"
+		}
+		return &Docker{
+			Socket:            sp,
+			Runner:            c.Runner,
+			NetworkPlugin:     c.NetworkPlugin,
+			ImageRepository:   c.ImageRepository,
+			KubernetesVersion: c.KubernetesVersion,
+			Init:              sm,
+			UseCRI:            (sp != ""), // !dockershim
+			CRIService:        cs,
+			GPUs:              c.GPUs,
+		}, nil
 	case "crio", "cri-o":
-		return &CRIO{Socket: c.Socket, Runner: c.Runner, ImageRepository: c.ImageRepository, KubernetesVersion: c.KubernetesVersion}, nil
+		return &CRIO{
+			Socket:            c.Socket,
+			Runner:            c.Runner,
+			ImageRepository:   c.ImageRepository,
+			KubernetesVersion: c.KubernetesVersion,
+			Init:              sm,
+		}, nil
 	case "containerd":
-		return &Containerd{Socket: c.Socket, Runner: c.Runner, ImageRepository: c.ImageRepository, KubernetesVersion: c.KubernetesVersion}, nil
+		return &Containerd{
+			Socket:            c.Socket,
+			Runner:            c.Runner,
+			ImageRepository:   c.ImageRepository,
+			KubernetesVersion: c.KubernetesVersion,
+			Init:              sm,
+			InsecureRegistry:  c.InsecureRegistry,
+		}, nil
 	default:
 		return nil, fmt.Errorf("unknown runtime type: %q", c.Type)
 	}
@@ -163,13 +278,23 @@ func disableOthers(me Manager, cr CommandRunner) error {
 		if r.Name() == me.Name() {
 			continue
 		}
-		// runtime is already disabled, nothing to do.
-		if !r.Active() {
+
+		// Don't disable containerd if we are bound to it
+		if me.Name() == "Docker" && r.Name() == "containerd" && dockerBoundToContainerd(cr) {
+			klog.Infof("skipping containerd shutdown because we are bound to it")
 			continue
 		}
-		if err = r.Disable(); err != nil {
-			glog.Warningf("disable failed: %v", err)
+		// in case of docker, if other runtime are already not active we are sure it is disabled, nothing to do.
+		// because #11515 for non-docker runtimes, we gotta ensure Docker is disabled and can not just check if it is not active
+		// since it is enabled by default in the current base image and it keeps coming back to life
+		if me.Name() == "Docker" && !r.Active() {
+			continue
 		}
+
+		if err = r.Disable(); err != nil {
+			klog.Warningf("disable failed: %v", err)
+		}
+
 		// Validate that the runtime really is offline - and that Active & Disable are properly written.
 		if r.Active() {
 			return fmt.Errorf("%s is still active", r.Name())
@@ -178,20 +303,47 @@ func disableOthers(me Manager, cr CommandRunner) error {
 	return nil
 }
 
-// enableIPForwarding configures IP forwarding, which is handled normally by Docker
-// Context: https://github.com/kubernetes/kubeadm/issues/1062
-func enableIPForwarding(cr CommandRunner) error {
-	c := exec.Command("sudo", "sysctl", "net.netfilter.nf_conntrack_count")
-	if rr, err := cr.RunCmd(c); err != nil {
-		glog.Infof("couldn't verify netfilter by %q which might be okay. error: %v", rr.Command(), err)
-		c = exec.Command("sudo", "modprobe", "br_netfilter")
-		if _, err := cr.RunCmd(c); err != nil {
-			return errors.Wrapf(err, "br_netfilter")
+var requiredContainerdVersion = semver.MustParse("1.4.0")
+
+// compatibleWithVersion checks if current version of "runtime" is compatible with version "v"
+func compatibleWithVersion(runtime, v string) error {
+	if runtime == "containerd" {
+		vv, err := semver.Make(v)
+		if err != nil {
+			return err
+		}
+		if requiredContainerdVersion.GT(vv) {
+			return NewErrServiceVersion(runtime, requiredContainerdVersion.String(), vv.String())
 		}
 	}
-	c = exec.Command("sudo", "sh", "-c", "echo 1 > /proc/sys/net/ipv4/ip_forward")
-	if _, err := cr.RunCmd(c); err != nil {
-		return errors.Wrapf(err, "ip_forward")
+	return nil
+}
+
+// CheckCompatibility checks if the container runtime managed by "cr" is compatible with current minikube code
+// returns: NewErrServiceVersion if not
+func CheckCompatibility(cr Manager) error {
+	v, err := cr.Version()
+	if err != nil {
+		return fmt.Errorf("Failed to check container runtime version: %w", err)
+	}
+	return compatibleWithVersion(cr.Name(), v)
+}
+
+// CheckKernelCompatibility returns an error when the kernel is older than the specified version.
+func CheckKernelCompatibility(cr CommandRunner, major, minor int) error {
+	expected := fmt.Sprintf("%d.%d", major, minor)
+	unameRes, err := cr.RunCmd(exec.Command("uname", "-r"))
+	if err != nil {
+		return err
+	}
+	actual := strings.TrimSpace(unameRes.Stdout.String())
+	sortRes, err := cr.RunCmd(exec.Command("sh", "-euc", fmt.Sprintf(`(echo %s; echo %s) | sort -V | head -n1`, actual, expected)))
+	if err != nil {
+		return err
+	}
+	comparison := strings.TrimSpace(sortRes.Stdout.String())
+	if comparison != expected {
+		return NewErrServiceVersion("kernel", expected, actual)
 	}
 	return nil
 }

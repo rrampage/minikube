@@ -12,43 +12,51 @@ description: >
 * Two minikube repos checked out locally:
   * Your personal fork
   * Upstream  
+  
+## Update the Kubernetes version
+
+* Run `make update-kubernetes-version` from your local upstream repo copy
+* If any files are updated, create and merge a PR before moving forward  
 
 ## Build a new ISO
 
-Major releases always get a new ISO. See [ISO release instructions]({{<ref "iso.md">}})
+* All non-patch releases require a new ISO to be built.
+* Patch releases (vx.x.1+) require a new ISO if the `deploy/iso` directory has seen changes since the previous release.
 
-## Update Makefile
+See [ISO release instructions]({{<ref "iso.md">}})
 
-Edit the minikube `Makefile`, updating the version number values at the top:
+## Release new kicbase image
 
-* `VERSION_MAJOR`, `VERSION_MINOR`, `VERSION_BUILD` as necessary
-* `ISO_VERSION` - defaults to MAJOR.MINOR.0 - update if point release requires a new ISO to be built.
-
-Make sure the integration tests run against this PR, once the new ISO is built. 
-
-You can merge this change at any time before the release, but often the Makefile change is merged the next step: Release notes.
+Run the `kic-release` job in Jenkins, which will automatically create a PR which must be merged (make sure to enter the correct version and repos).
 
 ## Update Release Notes
 
 Run the following script from your local upstream repo copy to generate updated release notes:
 
 ```shell
-hack/release_notes.sh
+make release-notes
 ```
 
-Paste the output into CHANGELOG.md. See [PR#3175](https://github.com/kubernetes/minikube/pull/3175) as an example. 
-
-You'll need to massage the output in a few key ways:
+Paste the output into CHANGELOG.md, sorting changes by importance to an end-user. If there are >8 changes, split them into *Improvements* and *Bug fixes*
 
 - The changelog should only contain user facing change. This means removing PR's for:
   - Documentation
   - Low-risk refactors
-  - Test-only changes 
-- Sort the changes so that the ones users will want to know about the most appear first
+  - Test-only changes
 - Remove bots from the contributor list
 - Remove duplicated similar names from the contributor list
 
-Merge the output into CHANGELOG.md. See [PR#3175](https://github.com/kubernetes/minikube/pull/3175) as an example. 
+You may merge this PR at any time, or combine it with a `Makefile` update PR.
+
+## Update Makefile
+
+Update the version numbers in  `Makefile`:
+
+* `VERSION_MAJOR`, `VERSION_MINOR`, `VERSION_BUILD`
+
+{{% alert title="Warning" color="warning" %}}
+Merge this PR only if all non-experimental integration tests pass!
+{{% /alert %}}
 
 ## Tag the Release
 
@@ -58,13 +66,14 @@ sh hack/tag_release.sh 1.<minor>.<patch>
 
 ## Build the Release
 
-This step uses the git tag to publish new binaries to GCS and create a github release:
+This step uses the git tag to publish new binaries to GCS and create a GitHub release:
 
 * Navigate to the minikube "Release" jenkins job
 * Ensure that you are logged in (top right)
 * Click "▶️ Build with Parameters" (left)
 * `VERSION_MAJOR`, `VERSION_MINOR`, and `VERSION_BUILD` should reflect the values in your Makefile
-* For `ISO_SHA256`, run: `gsutil cat gs://minikube/iso/minikube-v<version>.iso.sha256`
+* For `ISO_SHA256_AMD64`, run: `gsutil cat gs://minikube/iso/minikube-v<version>-amd64.iso.sha256`
+* For `ISO_SHA256_ARM64`, run: `gsutil cat gs://minikube/iso/minikube-v<version>-arm64.iso.sha256`
 * Click *Build*
 
 ## Check the release logs
@@ -73,17 +82,11 @@ After job completion, click "Console Output" to verify that the release complete
 
 **Note: If you are releasing a beta, you are done when you get here.**
 
-## Check releases.json
+## Merge the releases.json change
 
-This file is used for auto-update notifications, but is not active until releases.json is copied to GCS.
+The release script updates https://storage.googleapis.com/minikube/releases.json - which is used by the minikube binary to check for updates, and is live immediately.
 
-minikube-bot will send out a PR to update the release checksums at the top of `deploy/minikube/releases.json`. You should merge this PR.
-
-## Update documentation link
-
-Update `latest_release` in `site/config.toml`
-
-example: https://github.com/kubernetes/minikube/pull/5413
+minikube-bot will also send out a PR to merge this into the tree. Please merge this PR to keep GCS and GitHub in sync.
 
 ## Package managers which include minikube
 
@@ -104,6 +107,9 @@ Verify release checksums by running `make check-release`
 
 If there are major changes, please send a PR to update <https://kubernetes.io/docs/setup/learning-environment/minikube/>
 
+## Update SECURITY-INSIGHTS.yml
+Make appropriate changes to [SECURITY-INSIGHTS.yml](https://github.com/kubernetes/minikube/SECURITY-INSIGHTS.yml). Check [OPENSSF Security Insights Specification](https://github.com/ossf/security-insights-spec/blob/main/specification.md) for reference.
+
 ## Announce
 
 Please mention the new release https://github.com/kubernetes/minikube/blob/master/README.md
@@ -112,4 +118,4 @@ Other places:
 
 - #minikube on Slack
 - minikube-dev, minikube-users mailing list
-- Twitter (optional!)
+- Twitter (this is now automated with the @minikube_dev account)

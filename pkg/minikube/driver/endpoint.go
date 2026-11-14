@@ -17,25 +17,41 @@ limitations under the License.
 package driver
 
 import (
+	"fmt"
 	"net"
 
+	"k8s.io/klog/v2"
 	"k8s.io/minikube/pkg/drivers/kic/oci"
 	"k8s.io/minikube/pkg/minikube/config"
 	"k8s.io/minikube/pkg/minikube/constants"
+	"k8s.io/minikube/pkg/network"
 )
 
-// ControlPaneEndpoint returns the location where callers can reach this cluster
-func ControlPaneEndpoint(cc *config.ClusterConfig, cp *config.Node, driverName string) (string, net.IP, int, error) {
+// ControlPlaneEndpoint returns the location where callers can reach this cluster.
+func ControlPlaneEndpoint(cc *config.ClusterConfig, cp *config.Node, driverName string) (string, net.IP, int, error) {
 	if NeedsPortForward(driverName) {
 		port, err := oci.ForwardedPort(cc.Driver, cc.Name, cp.Port)
-		hostname := oci.DefaultBindIPV4
-		ip := net.ParseIP(hostname)
+		if err != nil {
+			klog.Warningf("failed to get forwarded control plane port %v", err)
+		}
+
+		hostname := oci.DaemonHost(driverName)
+
+		ips, err := net.LookupIP(hostname)
+		if err != nil || len(ips) == 0 {
+			return hostname, nil, port, fmt.Errorf("failed to lookup ip for %q", hostname)
+		}
 
 		// https://github.com/kubernetes/minikube/issues/3878
 		if cc.KubernetesConfig.APIServerName != constants.APIServerName {
 			hostname = cc.KubernetesConfig.APIServerName
 		}
-		return hostname, ip, port, err
+
+		return hostname, ips[0], port, nil
+	}
+
+	if IsQEMU(driverName) && network.IsBuiltinQEMU(cc.Network) {
+		return "localhost", net.IPv4(127, 0, 0, 1), cc.APIServerPort, nil
 	}
 
 	// https://github.com/kubernetes/minikube/issues/3878
@@ -43,5 +59,15 @@ func ControlPaneEndpoint(cc *config.ClusterConfig, cp *config.Node, driverName s
 	if cc.KubernetesConfig.APIServerName != constants.APIServerName {
 		hostname = cc.KubernetesConfig.APIServerName
 	}
-	return hostname, net.ParseIP(cp.IP), cp.Port, nil
+	ips, err := net.LookupIP(cp.IP)
+	if err != nil || len(ips) == 0 {
+		return hostname, nil, cp.Port, fmt.Errorf("failed to lookup ip for %q", cp.IP)
+	}
+	return hostname, ips[0], cp.Port, nil
+}
+
+// AutoPauseProxyEndpoint returns the endpoint for the auto-pause (reverse proxy to api-sever)
+func AutoPauseProxyEndpoint(cc *config.ClusterConfig, cp *config.Node, driverName string) (string, net.IP, int, error) {
+	cp.Port = constants.AutoPauseProxyPort
+	return ControlPlaneEndpoint(cc, cp, driverName)
 }

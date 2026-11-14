@@ -21,6 +21,7 @@ import (
 	"k8s.io/minikube/pkg/minikube/exit"
 	"k8s.io/minikube/pkg/minikube/notify"
 	"k8s.io/minikube/pkg/minikube/out"
+	"k8s.io/minikube/pkg/minikube/reason"
 	"k8s.io/minikube/pkg/version"
 )
 
@@ -28,18 +29,18 @@ var updateCheckCmd = &cobra.Command{
 	Use:   "update-check",
 	Short: "Print current and latest version number",
 	Long:  `Print current and latest version number`,
-	Run: func(command *cobra.Command, args []string) {
+	Run: func(_ *cobra.Command, _ []string) {
 		url := notify.GithubMinikubeReleasesURL
-		r, err := notify.GetAllVersionsFromURL(url)
+		r, err := notify.AllVersionsFromURL(url)
 		if err != nil {
-			exit.WithError("Unable to fetch latest version info", err)
+			exit.Error(reason.InetVersionUnavailable, "Unable to fetch latest version info", err)
 		}
 
-		if len(r) < 1 {
-			exit.WithCodeT(exit.Data, "Update server returned an empty list")
+		if len(r.Releases) < 1 {
+			exit.Message(reason.InetVersionEmpty, "Update server returned an empty list")
 		}
 
 		out.Ln("CurrentVersion: %s", version.GetVersion())
-		out.Ln("LatestVersion: %s", r[0].Name)
+		out.Ln("LatestVersion: %s", r.Releases[0].Name)
 	},
 }

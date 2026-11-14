@@ -18,6 +18,7 @@ package command
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"os/exec"
@@ -26,9 +27,7 @@ import (
 
 	"golang.org/x/sync/syncmap"
 
-	"github.com/golang/glog"
-	"github.com/pkg/errors"
-
+	"k8s.io/klog/v2"
 	"k8s.io/minikube/pkg/minikube/assets"
 )
 
@@ -50,7 +49,7 @@ func NewFakeCommandRunner() *FakeCommandRunner {
 // RunCmd implements the Command Runner interface to run a exec.Cmd object
 func (f *FakeCommandRunner) RunCmd(cmd *exec.Cmd) (*RunResult, error) {
 	rr := &RunResult{Args: cmd.Args}
-	glog.Infof("(FakeCommandRunner) Run:  %v", rr.Command())
+	klog.Infof("(FakeCommandRunner) Run:  %v", rr.Command())
 
 	start := time.Now()
 
@@ -64,7 +63,7 @@ func (f *FakeCommandRunner) RunCmd(cmd *exec.Cmd) (*RunResult, error) {
 
 		var txt strings.Builder
 		for _, c := range f.commands() {
-			txt.WriteString(fmt.Sprintf("  `%s`\n", c))
+			fmt.Fprintf(&txt, "  `%s`\n", c)
 		}
 		return rr, fmt.Errorf("unregistered command:\n  `%s`\nexpected one of:\n%s", key, txt.String())
 	}
@@ -72,11 +71,15 @@ func (f *FakeCommandRunner) RunCmd(cmd *exec.Cmd) (*RunResult, error) {
 	var buf bytes.Buffer
 	outStr := ""
 	if out != nil {
-		outStr = out.(string)
+		var ok bool
+		outStr, ok = out.(string)
+		if !ok {
+			return rr, fmt.Errorf("unregistered or invalid command output type for %q: expected string but got %T", key, out)
+		}
 	}
 	_, err := buf.WriteString(outStr)
 	if err != nil {
-		return rr, errors.Wrap(err, "Writing outStr to FakeCommandRunner's buffer")
+		return rr, fmt.Errorf("Writing outStr to FakeCommandRunner's buffer: %w", err)
 	}
 	rr.Stdout = buf
 	rr.Stderr = buf
@@ -85,9 +88,54 @@ func (f *FakeCommandRunner) RunCmd(cmd *exec.Cmd) (*RunResult, error) {
 
 	// Reduce log spam
 	if elapsed > (1 * time.Second) {
-		glog.Infof("(FakeCommandRunner) Done: %v: (%s)", rr.Command(), elapsed)
+		klog.Infof("(FakeCommandRunner) Done: %v: (%s)", rr.Command(), elapsed)
 	}
 	return rr, nil
+}
+
+// StartCmd implements the Command Runner interface to start a exec.Cmd object
+func (f *FakeCommandRunner) StartCmd(cmd *exec.Cmd) (*StartedCmd, error) {
+	rr := &RunResult{Args: cmd.Args}
+	sc := &StartedCmd{cmd: cmd, rr: rr}
+	klog.Infof("(FakeCommandRunner) Start:  %v", rr.Command())
+
+	key := rr.Command()
+	out, ok := f.cmdMap.Load(key)
+	if !ok {
+		cmds := f.commands()
+		if len(cmds) == 0 {
+			return sc, fmt.Errorf("asked to execute %s, but FakeCommandRunner has no commands stored", rr.Command())
+		}
+
+		var txt strings.Builder
+		for _, c := range f.commands() {
+			fmt.Fprintf(&txt, "  `%s`\n", c)
+		}
+		return sc, fmt.Errorf("unregistered command:\n  `%s`\nexpected one of:\n%s", key, txt.String())
+	}
+
+	var buf bytes.Buffer
+	outStr := ""
+	if out != nil {
+		var ok bool
+		outStr, ok = out.(string)
+		if !ok {
+			return sc, fmt.Errorf("unregistered or invalid command output type for %q: expected string but got %T", key, out)
+		}
+	}
+	_, err := buf.WriteString(outStr)
+	if err != nil {
+		return sc, fmt.Errorf("Writing outStr to FakeCommandRunner's buffer: %w", err)
+	}
+	rr.Stdout = buf
+	rr.Stderr = buf
+
+	return sc, nil
+}
+
+// WaitCmd implements the Command Runner interface to wait until a started exec.Cmd object finishes
+func (f *FakeCommandRunner) WaitCmd(sc *StartedCmd) (*RunResult, error) {
+	return sc.rr, nil
 }
 
 // Copy adds the filename, file contents key value pair to the stored map.
@@ -95,16 +143,43 @@ func (f *FakeCommandRunner) Copy(file assets.CopyableFile) error {
 	var b bytes.Buffer
 	_, err := io.Copy(&b, file)
 	if err != nil {
-		return errors.Wrapf(err, "error reading file: %+v", file)
+		return fmt.Errorf("error reading file: %+v: %w", file, err)
 	}
-	f.fileMap.Store(file.GetAssetName(), b.String())
+	f.fileMap.Store(file.GetSourcePath(), b.String())
+	return nil
+}
+
+// CopyFrom copy content from file to the stored map.
+func (f *FakeCommandRunner) CopyFrom(file assets.CopyableFile) error {
+	v, ok := f.fileMap.Load(file.GetSourcePath())
+	if !ok {
+		return errors.New("not found in map")
+	}
+	var b bytes.Buffer
+	switch val := v.(type) {
+	case string:
+		b.WriteString(val)
+	case bytes.Buffer:
+		b = val
+	default:
+		return fmt.Errorf("file contents for %s is of unexpected type %T", file.GetSourcePath(), v)
+	}
+	_, err := io.Copy(file, &b)
+	if err != nil {
+		return fmt.Errorf("error writing file: %+v: %w", file, err)
+	}
 	return nil
 }
 
 // Remove removes the filename, file contents key value pair from the stored map
 func (f *FakeCommandRunner) Remove(file assets.CopyableFile) error {
-	f.fileMap.Delete(file.GetAssetName())
+	f.fileMap.Delete(file.GetSourcePath())
 	return nil
+}
+
+// ReadableFile implements interface (without implementation)
+func (f *FakeCommandRunner) ReadableFile(_ string) (assets.ReadableFile, error) {
+	return nil, nil
 }
 
 // SetFileToContents stores the file to contents map for the FakeCommandRunner
@@ -117,7 +192,7 @@ func (f *FakeCommandRunner) SetFileToContents(fileToContents map[string]string) 
 // SetCommandToOutput stores the file to contents map for the FakeCommandRunner
 func (f *FakeCommandRunner) SetCommandToOutput(cmdToOutput map[string]string) {
 	for k, v := range cmdToOutput {
-		glog.Infof("fake command %q -> %q", k, v)
+		klog.Infof("fake command %q -> %q", k, v)
 		f.cmdMap.Store(k, v)
 	}
 }
@@ -128,12 +203,15 @@ func (f *FakeCommandRunner) GetFileToContents(filename string) (string, error) {
 	if !ok {
 		return "", fmt.Errorf("unavailable file: %s", filename)
 	}
-	return contents.(string), nil
+	if str, ok := contents.(string); ok {
+		return str, nil
+	}
+	return "", fmt.Errorf("file contents for %s is of unexpected type %T", filename, contents)
 }
 
 func (f *FakeCommandRunner) commands() []string {
 	cmds := []string{}
-	f.cmdMap.Range(func(k, v interface{}) bool {
+	f.cmdMap.Range(func(k, _ interface{}) bool {
 		cmds = append(cmds, fmt.Sprintf("%s", k))
 		return true
 	})
@@ -148,7 +226,7 @@ func (f *FakeCommandRunner) DumpMaps(w io.Writer) {
 		return true
 	})
 	fmt.Fprintln(w, "Filenames: ")
-	f.fileMap.Range(func(k, v interface{}) bool {
+	f.fileMap.Range(func(k, _ interface{}) bool {
 		fmt.Fprint(w, k)
 		return true
 	})

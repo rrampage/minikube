@@ -17,25 +17,15 @@ limitations under the License.
 package machine
 
 import (
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
 	"k8s.io/minikube/pkg/minikube/localpath"
+	testutil "k8s.io/minikube/pkg/minikube/tests"
 	"k8s.io/minikube/pkg/minikube/vmpath"
 )
-
-func setupTestDir() (string, error) {
-	path, err := ioutil.TempDir("", "minipath")
-	if err != nil {
-		return "", err
-	}
-
-	os.Setenv(localpath.MinikubeHome, path)
-	return path, err
-}
 
 func TestAssetsFromDir(t *testing.T) {
 	tests := []struct {
@@ -107,11 +97,7 @@ func TestAssetsFromDir(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.description, func(t *testing.T) {
-			testDir, err := setupTestDir()
-			if err != nil {
-				t.Errorf("got unexpected error creating test dir: %v", err)
-				return
-			}
+			testDir := testutil.MakeTempDir(t)
 
 			testDirs = append(testDirs, testDir)
 			testFileBaseDir := filepath.Join(testDir, test.baseDir)
@@ -149,7 +135,13 @@ func TestAssetsFromDir(t *testing.T) {
 
 			got := make(map[string]string)
 			for _, actualFile := range actualFiles {
-				got[actualFile.GetAssetName()] = actualFile.GetTargetDir()
+				got[actualFile.GetSourcePath()] = actualFile.GetTargetDir()
+			}
+			// close any open file handles returned by assetsFromDir so Windows can clean up the temp dir
+			for _, actualFile := range actualFiles {
+				if c, ok := actualFile.(interface{ Close() error }); ok {
+					_ = c.Close()
+				}
 			}
 			if diff := cmp.Diff(want, got); diff != "" {
 				t.Errorf("files differ: (-want +got)\n%s", diff)

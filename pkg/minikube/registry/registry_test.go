@@ -18,8 +18,10 @@ package registry
 
 import (
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
+	"k8s.io/minikube/pkg/minikube/run"
 )
 
 func TestRegister(t *testing.T) {
@@ -30,6 +32,22 @@ func TestRegister(t *testing.T) {
 	}
 	if err := r.Register(foo); err == nil {
 		t.Errorf("Register = nil, expected duplicate err")
+	}
+}
+
+func TestRegisterRequiresProbeTimeout(t *testing.T) {
+	r := newRegistry()
+	foo := DriverDef{
+		Name:   "foo",
+		Status: func(_ *run.CommandOptions) State { return State{} },
+	}
+	if err := r.Register(foo); err == nil {
+		t.Errorf("Register = nil, expected ProbeTimeout err")
+	}
+
+	foo.ProbeTimeout = time.Second
+	if err := r.Register(foo); err != nil {
+		t.Errorf("Register = %v, expected nil", err)
 	}
 }
 
@@ -61,5 +79,33 @@ func TestList(t *testing.T) {
 
 	if diff := cmp.Diff(r.List(), []DriverDef{foo}); diff != "" {
 		t.Errorf("list mismatch (-want +got):\n%s", diff)
+	}
+}
+
+func TestDriverAlias(t *testing.T) {
+	foo := DriverDef{Name: "foo", Alias: []string{"foo-alias"}}
+	r := newRegistry()
+
+	if err := r.Register(foo); err != nil {
+		t.Errorf("Register = %v, expected nil", err)
+	}
+
+	d := r.Driver("foo")
+	if d.Empty() {
+		t.Errorf("driver.Empty = true, expected false")
+	}
+
+	d = r.Driver("foo-alias")
+	if d.Empty() {
+		t.Errorf("driver.Empty = true, expected false")
+	}
+
+	if diff := cmp.Diff(r.List(), []DriverDef{foo}); diff != "" {
+		t.Errorf("list mismatch (-want +got):\n%s", diff)
+	}
+
+	d = r.Driver("bar")
+	if !d.Empty() {
+		t.Errorf("driver.Empty = false, expected true")
 	}
 }

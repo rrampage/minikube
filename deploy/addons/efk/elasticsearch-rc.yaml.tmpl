@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-apiVersion: v1
-kind: ReplicationController
+apiVersion: apps/v1
+kind: Deployment
 metadata:
   name: elasticsearch-logging
   namespace: kube-system
@@ -24,17 +24,20 @@ metadata:
 spec:
   replicas: 1
   selector:
-    k8s-app: elasticsearch-logging
-    addonmanager.kubernetes.io/mode: Reconcile
+    matchLabels:
+      k8s-app: elasticsearch-logging
+      kubernetes.io/minikube-addons: efk
+      addonmanager.kubernetes.io/mode: Reconcile
   template:
     metadata:
       labels:
         k8s-app: elasticsearch-logging
+        kubernetes.io/minikube-addons: efk
         addonmanager.kubernetes.io/mode: Reconcile
     spec:
       containers:
       - name: elasticsearch-logging
-        image: {{default "k8s.gcr.io" .ImageRepository}}/elasticsearch:v5.6.2
+        image: {{.CustomRegistries.Elasticsearch  | default .ImageRepository | default .Registries.Elasticsearch }}{{.Images.Elasticsearch}}
         resources:
           limits:
             cpu: 500m
@@ -62,7 +65,7 @@ spec:
         - name: ES_JAVA_OPTS
           value: "-Xms1024m -Xmx1024m"
       initContainers:
-      - image: registry.hub.docker.com/library/alpine:3.6
+      - image: {{.CustomRegistries.Alpine  | default .ImageRepository | default .Registries.Alpine }}{{.Images.Alpine}}
         command: ["/sbin/sysctl", "-w", "vm.max_map_count=262144"]
         name: elasticsearch-logging-init
         securityContext:

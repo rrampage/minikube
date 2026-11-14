@@ -1,4 +1,4 @@
-// +build integration
+//go:build integration
 
 /*
 Copyright 2019 The Kubernetes Authors All rights reserved.
@@ -19,108 +19,184 @@ limitations under the License.
 package integration
 
 import (
+	"bufio"
+	"bytes"
 	"context"
-	"crypto/md5"
+	"crypto/sha256"
+	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 
+	"k8s.io/minikube/pkg/libmachine/mcnutils"
 	"k8s.io/minikube/pkg/minikube/bootstrapper/images"
 	"k8s.io/minikube/pkg/minikube/constants"
 	"k8s.io/minikube/pkg/minikube/download"
 	"k8s.io/minikube/pkg/minikube/localpath"
 )
 
-func TestDownloadOnly(t *testing.T) {
-	for _, r := range []string{"crio", "docker", "containerd"} {
-		t.Run(r, func(t *testing.T) {
-			// Stores the startup run result for later error messages
-			var rrr *RunResult
-			var err error
+// TestDownloadOnly makes sure the --download-only parameter in minikube start caches the appropriate images and tarballs.
+func TestDownloadOnly(t *testing.T) { // nolint:gocyclo
+	if DockerDriver() {
+		t.Skip("skipping: flaky on Docker driver: https://github.com/kubernetes/minikube/issues/23163")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), Minutes(30))
 
-			profile := UniqueProfileName(r)
-			ctx, cancel := context.WithTimeout(context.Background(), Minutes(30))
-			defer Cleanup(t, profile, cancel)
+	// separate each k8s version testrun into individual profiles to avoid ending up with subsequently mixed up configs like:
+	// {Name:download-only-062906 ... KubernetesConfig:{KubernetesVersion:v1.28.4 ...} Nodes:[{Name: IP: Port:8443 KubernetesVersion:v1.16.0 ...}] ...}
+	// that will then get artifacts for node's not cluster's KubernetesVersion and fail checks thereafter
+	// at the end, cleanup all profiles
+	profiles := []string{}
+	defer func() {
+		for _, profile := range profiles {
+			Cleanup(t, profile, cancel)
+		}
+	}()
 
-			versions := []string{
-				constants.OldestKubernetesVersion,
-				constants.DefaultKubernetesVersion,
-				constants.NewestKubernetesVersion,
-			}
+	containerRuntime := ContainerRuntime()
 
-			for _, v := range versions {
-				t.Run(v, func(t *testing.T) {
-					// Explicitly does not pass StartArgs() to test driver default
-					// --force to avoid uid check
-					args := append([]string{"start", "--download-only", "-p", profile, "--force", "--alsologtostderr", fmt.Sprintf("--kubernetes-version=%s", v), fmt.Sprintf("--container-runtime=%s", r)}, StartArgs()...)
+	versions := []string{
+		constants.OldestKubernetesVersion,
+		constants.DefaultKubernetesVersion,
+		constants.NewestKubernetesVersion,
+	}
 
-					// Preserve the initial run-result for debugging
-					if rrr == nil {
-						rrr, err = Run(t, exec.CommandContext(ctx, Target(), args...))
-					} else {
-						_, err = Run(t, exec.CommandContext(ctx, Target(), args...))
-					}
+	// Remove duplicate versions, preserving order. Right now Default and
+	// Newest are the same, so we would otherwise run the same test twice.
+	deduped := make([]string, 0, len(versions))
+	for _, v := range versions {
+		if !slices.Contains(deduped, v) {
+			deduped = append(deduped, v)
+		}
+	}
+	versions = deduped
 
+	for _, v := range versions {
+		t.Run(v, func(t *testing.T) {
+			profile := UniqueProfileName("download-only")
+			profiles = append(profiles, profile)
+			defer PostMortemLogs(t, profile)
+
+			t.Run("json-events", func(t *testing.T) {
+				// --force to avoid uid check
+				args := append([]string{"start", "-o=json", "--download-only", "-p", profile, "--force", "--alsologtostderr", fmt.Sprintf("--kubernetes-version=%s", v), fmt.Sprintf("--container-runtime=%s", containerRuntime)}, StartArgs()...)
+				rt, err := Run(t, exec.CommandContext(ctx, Target(), args...))
+				if err != nil {
+					t.Errorf("failed to download only. args: %q %v", args, err)
+				}
+
+				s := bufio.NewScanner(bytes.NewReader(rt.Stdout.Bytes()))
+				for s.Scan() {
+					var rtObj map[string]interface{}
+					err := json.Unmarshal(s.Bytes(), &rtObj)
 					if err != nil {
-						t.Errorf("failed to download only. args: %q %v", args, err)
-					}
-
-					// skip for none, as none driver does not have preload feature.
-					if !NoneDriver() {
-						if download.PreloadExists(v, r) {
-							// Just make sure the tarball path exists
-							if _, err := os.Stat(download.TarballPath(v, r)); err != nil {
-								t.Errorf("failed to verify preloaded tarball file exists: %v", err)
+						t.Errorf("failed to parse output: %v", err)
+					} else if step, ok := rtObj["data"]; ok {
+						if stepMap, ok := step.(map[string]interface{}); ok {
+							if stepMap["currentstep"] == "" {
+								t.Errorf("Empty step number for %v", stepMap["name"])
 							}
-							return
 						}
 					}
-					imgs, err := images.Kubeadm("", v)
+				}
+				if err := s.Err(); err != nil {
+					t.Errorf("failed to read output: %v", err)
+				}
+			})
+
+			preloadExists := false
+			t.Run("preload-exists", func(t *testing.T) {
+				// skip for none, as none driver does not have preload feature.
+				if NoneDriver() {
+					t.Skip("None driver does not have preload")
+				}
+				// Driver does not matter here, since the only exception is none driver,
+				// which cannot occur here.
+				if !download.PreloadExists(v, containerRuntime, "docker", true) {
+					t.Skip("No preload image")
+				}
+				// Just make sure the tarball path exists
+				if _, err := os.Stat(download.TarballPath(v, containerRuntime)); err != nil {
+					t.Errorf("failed to verify preloaded tarball file exists: %v", err)
+				}
+				preloadExists = true
+			})
+
+			t.Run("cached-images", func(t *testing.T) {
+				// skip verify for cache images if --driver=none
+				if NoneDriver() {
+					t.Skip("None driver has no cache")
+				}
+				if preloadExists {
+					t.Skip("Preload exists, images won't be cached")
+				}
+				imgs, err := images.Kubeadm("", v)
+				if err != nil {
+					t.Errorf("failed to get kubeadm images for %v: %+v", v, err)
+				}
+
+				for _, img := range imgs {
+					pathToImage := []string{localpath.MiniPath(), "cache", "images", runtime.GOARCH}
+					img = strings.Replace(img, ":", "_", 1) // for example kube-scheduler:v1.15.2 --> kube-scheduler_v1.15.2
+					imagePath := strings.Split(img, "/")    // changes "gcr.io/k8s-minikube/storage-provisioner_v5" into ["gcr.io", "k8s-minikube", "storage-provisioner_v5"] to match cache folder structure
+					pathToImage = append(pathToImage, imagePath...)
+					fp := filepath.Join(pathToImage...)
+					_, err := os.Stat(fp)
 					if err != nil {
-						t.Errorf("failed to get kubeadm images for %v: %+v", v, err)
+						t.Errorf("expected image file exist at %q but got error: %v", fp, err)
 					}
+				}
+			})
 
-					// skip verify for cache images if --driver=none
-					if !NoneDriver() {
-						for _, img := range imgs {
-							img = strings.Replace(img, ":", "_", 1) // for example kube-scheduler:v1.15.2 --> kube-scheduler_v1.15.2
-							fp := filepath.Join(localpath.MiniPath(), "cache", "images", img)
-							_, err := os.Stat(fp)
-							if err != nil {
-								t.Errorf("expected image file exist at %q but got error: %v", fp, err)
-							}
-						}
-					}
-
-					// checking binaries downloaded (kubelet,kubeadm)
-					for _, bin := range constants.KubernetesReleaseBinaries {
-						fp := filepath.Join(localpath.MiniPath(), "cache", "linux", v, bin)
-						_, err := os.Stat(fp)
-						if err != nil {
-							t.Errorf("expected the file for binary exist at %q but got error %v", fp, err)
-						}
-					}
-
-					// If we are on darwin/windows, check to make sure OS specific kubectl has been downloaded
-					// as well for the `minikube kubectl` command
-					if runtime.GOOS == "linux" {
-						return
-					}
-					binary := "kubectl"
-					if runtime.GOOS == "windows" {
-						binary = "kubectl.exe"
-					}
-					fp := filepath.Join(localpath.MiniPath(), "cache", runtime.GOOS, v, binary)
-					if _, err := os.Stat(fp); err != nil {
+			t.Run("binaries", func(t *testing.T) {
+				if preloadExists {
+					t.Skip("Preload exists, binaries are present within.")
+				}
+				// checking binaries downloaded (kubelet,kubeadm)
+				for _, bin := range constants.KubernetesReleaseBinaries {
+					fp := filepath.Join(localpath.MiniPath(), "cache", "linux", runtime.GOARCH, v, bin)
+					_, err := os.Stat(fp)
+					if err != nil {
 						t.Errorf("expected the file for binary exist at %q but got error %v", fp, err)
 					}
-				})
-			}
+				}
+			})
+
+			t.Run("kubectl", func(t *testing.T) {
+				// If we are on darwin/windows, check to make sure OS specific kubectl has been downloaded
+				// as well for the `minikube kubectl` command
+				if runtime.GOOS == "linux" {
+					t.Skip("Test for darwin and windows")
+				}
+				binary := "kubectl"
+				if runtime.GOOS == "windows" {
+					binary = "kubectl.exe"
+				}
+				fp := filepath.Join(localpath.MiniPath(), "cache", runtime.GOOS, runtime.GOARCH, v, binary)
+				if _, err := os.Stat(fp); err != nil {
+					t.Errorf("expected the file for binary exist at %q but got error %v", fp, err)
+				}
+			})
+
+			// checks if the duration of `minikube logs` takes longer than 5 seconds
+			t.Run("LogsDuration", func(t *testing.T) {
+				ctx, cancel := context.WithTimeout(context.Background(), Seconds(5))
+				defer cancel()
+				args := []string{"logs", "-p", profile}
+				if _, err := Run(t, exec.CommandContext(ctx, Target(), args...)); err != nil {
+					t.Logf("minikube logs failed with error: %v", err)
+				}
+				if err := ctx.Err(); err == context.DeadlineExceeded {
+					t.Error("minikube logs expected to finish by 5 seconds, but took longer")
+				}
+			})
 
 			// This is a weird place to test profile deletion, but this test is serial, and we have a profile to delete!
 			t.Run("DeleteAll", func(t *testing.T) {
@@ -132,6 +208,7 @@ func TestDownloadOnly(t *testing.T) {
 					t.Errorf("failed to delete all. args: %q : %v", rr.Command(), err)
 				}
 			})
+
 			// Delete should always succeed, even if previously partially or fully deleted.
 			t.Run("DeleteAlwaysSucceeds", func(t *testing.T) {
 				if !CanCleanup() {
@@ -146,36 +223,111 @@ func TestDownloadOnly(t *testing.T) {
 	}
 }
 
+// TestDownloadOnlyKic makes sure --download-only caches the docker driver images as well.
 func TestDownloadOnlyKic(t *testing.T) {
 	if !KicDriver() {
 		t.Skip("skipping, only for docker or podman driver")
+	}
+	if DockerDriver() {
+		t.Skip("skipping: flaky on Docker driver: https://github.com/kubernetes/minikube/issues/23163")
 	}
 	profile := UniqueProfileName("download-docker")
 	ctx, cancel := context.WithTimeout(context.Background(), Minutes(15))
 	defer Cleanup(t, profile, cancel)
 
-	cRuntime := "docker"
+	cRuntime := ContainerRuntime()
 
-	args := []string{"start", "--download-only", "-p", profile, "--force", "--alsologtostderr"}
+	args := []string{"start", "--download-only", "-p", profile, "--alsologtostderr"}
 	args = append(args, StartArgs()...)
 
-	if _, err := Run(t, exec.CommandContext(ctx, Target(), args...)); err != nil {
+	cmd := exec.CommandContext(ctx, Target(), args...)
+	if _, err := Run(t, cmd); err != nil {
 		t.Errorf("start with download only failed %q : %v", args, err)
 	}
 
 	// Make sure the downloaded image tarball exists
 	tarball := download.TarballPath(constants.DefaultKubernetesVersion, cRuntime)
-	contents, err := ioutil.ReadFile(tarball)
+	fi, err := os.Stat(tarball)
 	if err != nil {
-		t.Errorf("failed to read tarball file %q: %v", tarball, err)
+		t.Errorf("expected tarball file %q to exist, but got error: %v", tarball, err)
+	} else {
+		const minSize int64 = 200 * 1024 * 1024 // 200 MB
+		if fi.Size() <= minSize {
+			t.Errorf("expected tarball file %q to be larger than 200MB (>%d bytes), got %d bytes", tarball, minSize, fi.Size())
+		}
 	}
-	// Make sure it has the correct checksum
-	checksum := md5.Sum(contents)
-	remoteChecksum, err := ioutil.ReadFile(download.PreloadChecksumPath(constants.DefaultKubernetesVersion, cRuntime))
+
+	if arm64Platform() {
+		t.Skip("Skip for arm64 platform. See https://github.com/kubernetes/minikube/issues/10144")
+	}
+}
+
+// createSha256File is a helper function which creates sha256 checksum file from given file
+func createSha256File(filePath string) error {
+	dat, _ := os.ReadFile(filePath)
+	sum := sha256.Sum256(dat)
+
+	f, err := os.Create(filePath + ".sha256")
 	if err != nil {
-		t.Errorf("failed to read checksum file %q : %v", download.PreloadChecksumPath(constants.DefaultKubernetesVersion, cRuntime), err)
+		return err
 	}
-	if string(remoteChecksum) != string(checksum[:]) {
-		t.Errorf("failed to verify checksum. checksum of %q does not match remote checksum (%q != %q)", tarball, string(remoteChecksum), string(checksum[:]))
+	defer f.Close()
+
+	_, err = fmt.Fprintf(f, "%x", sum[:])
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+// TestBinaryMirror tests functionality of --binary-mirror flag
+func TestBinaryMirror(t *testing.T) {
+	profile := UniqueProfileName("binary-mirror")
+	ctx, cancel := context.WithTimeout(context.Background(), Minutes(10))
+	defer Cleanup(t, profile, cancel)
+
+	tmpDir := t.TempDir()
+
+	// Start test server which will serve binary files
+	ts := httptest.NewServer(
+		http.FileServer(http.Dir(tmpDir)),
+	)
+	defer ts.Close()
+
+	binaryName := "kubectl"
+	if runtime.GOOS == "windows" {
+		binaryName = "kubectl.exe"
+	}
+	binaryPath, err := download.Binary(binaryName, constants.DefaultKubernetesVersion, runtime.GOOS, runtime.GOARCH, "")
+	if err != nil {
+		t.Errorf("Failed to download binary: %+v", err)
+	}
+
+	newBinaryDir := filepath.Join(tmpDir, constants.DefaultKubernetesVersion, "bin", runtime.GOOS, runtime.GOARCH)
+	if err := os.MkdirAll(newBinaryDir, os.ModePerm); err != nil {
+		t.Errorf("Failed to create %s directories", newBinaryDir)
+	}
+
+	newBinaryPath := filepath.Join(newBinaryDir, binaryName)
+	// Usage of os.Rename might result in "invalid cross-device link" error if the files are not on the same partition.
+	// In that case, we fall back to copying the file.
+	if err := os.Rename(binaryPath, newBinaryPath); err != nil {
+		t.Logf("os.Rename failed, falling back to copy (likely cross-device): %v", err)
+		if err := mcnutils.CopyFile(binaryPath, newBinaryPath); err != nil {
+			t.Fatalf("Failed to copy binary file: %v", err)
+		}
+		if err := os.Remove(binaryPath); err != nil {
+			t.Logf("Warning: Failed to remove original binary file: %v", err)
+		}
+	}
+	if err := createSha256File(newBinaryPath); err != nil {
+		t.Errorf("Failed to generate sha256 checksum file: %+v", err)
+	}
+
+	args := append([]string{"start", "--download-only", "-p", profile, "--alsologtostderr", "--binary-mirror", ts.URL}, StartArgs()...)
+
+	cmd := exec.CommandContext(ctx, Target(), args...)
+	if _, err := Run(t, cmd); err != nil {
+		t.Errorf("start with --binary-mirror failed %q : %v", args, err)
 	}
 }

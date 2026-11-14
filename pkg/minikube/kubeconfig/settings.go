@@ -17,14 +17,14 @@ limitations under the License.
 package kubeconfig
 
 import (
-	"io/ioutil"
+	"fmt"
+	"os"
 	"path/filepath"
 	"sync/atomic"
 
-	"github.com/golang/glog"
-	"github.com/juju/mutex"
-	"github.com/pkg/errors"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/clientcmd/api"
+	"k8s.io/klog/v2"
 	"k8s.io/minikube/pkg/util/lock"
 )
 
@@ -33,7 +33,10 @@ type Settings struct {
 	// The name of the cluster for this context
 	ClusterName string
 
-	// ClusterServerAddress is the address of the kubernetes cluster
+	// The name of the namespace for this context
+	Namespace string
+
+	// ClusterServerAddress is the address of the Kubernetes cluster
 	ClusterServerAddress string
 
 	// ClientCertificate is the path to a client cert file for TLS.
@@ -51,6 +54,12 @@ type Settings struct {
 	// Should the certificate files be embedded instead of referenced by path
 	EmbedCerts bool
 
+	// Extension meta data for the cluster
+	ExtensionCluster *Extension
+
+	// Extension meta data for the cluster
+	ExtensionContext *Extension
+
 	// kubeConfigFile is the path where the kube config is stored
 	// Only access this with atomic ops
 	kubeConfigFile atomic.Value
@@ -61,9 +70,13 @@ func (k *Settings) SetPath(kubeConfigFile string) {
 	k.kubeConfigFile.Store(kubeConfigFile)
 }
 
-// filePath gets the kubeconfig file
+// filePath gets the kubeconfig file, falling back to PathFromEnv() if empty or uninitialized.
 func (k *Settings) filePath() string {
-	return k.kubeConfigFile.Load().(string)
+	if val, ok := k.kubeConfigFile.Load().(string); ok && val != "" {
+		return val
+	}
+	// this hopefully never happens
+	return PathFromEnv()
 }
 
 // PopulateFromSettings populates an api.Config object with values from *Settings
@@ -73,12 +86,16 @@ func PopulateFromSettings(cfg *Settings, apiCfg *api.Config) error {
 	cluster := api.NewCluster()
 	cluster.Server = cfg.ClusterServerAddress
 	if cfg.EmbedCerts {
-		cluster.CertificateAuthorityData, err = ioutil.ReadFile(cfg.CertificateAuthority)
+		cluster.CertificateAuthorityData, err = os.ReadFile(cfg.CertificateAuthority)
 		if err != nil {
-			return errors.Wrapf(err, "reading CertificateAuthority %s", cfg.CertificateAuthority)
+			return fmt.Errorf("reading CertificateAuthority %s: %w", cfg.CertificateAuthority, err)
 		}
 	} else {
 		cluster.CertificateAuthority = cfg.CertificateAuthority
+	}
+
+	if cfg.ExtensionCluster != nil {
+		cluster.Extensions = map[string]runtime.Object{"cluster_info": cfg.ExtensionCluster.DeepCopy()}
 	}
 	apiCfg.Clusters[clusterName] = cluster
 
@@ -86,13 +103,13 @@ func PopulateFromSettings(cfg *Settings, apiCfg *api.Config) error {
 	userName := cfg.ClusterName
 	user := api.NewAuthInfo()
 	if cfg.EmbedCerts {
-		user.ClientCertificateData, err = ioutil.ReadFile(cfg.ClientCertificate)
+		user.ClientCertificateData, err = os.ReadFile(cfg.ClientCertificate)
 		if err != nil {
-			return errors.Wrapf(err, "reading ClientCertificate %s", cfg.ClientCertificate)
+			return fmt.Errorf("reading ClientCertificate %s: %w", cfg.ClientCertificate, err)
 		}
-		user.ClientKeyData, err = ioutil.ReadFile(cfg.ClientKey)
+		user.ClientKeyData, err = os.ReadFile(cfg.ClientKey)
 		if err != nil {
-			return errors.Wrapf(err, "reading ClientKey %s", cfg.ClientKey)
+			return fmt.Errorf("reading ClientKey %s: %w", cfg.ClientKey, err)
 		}
 	} else {
 		user.ClientCertificate = cfg.ClientCertificate
@@ -104,7 +121,12 @@ func PopulateFromSettings(cfg *Settings, apiCfg *api.Config) error {
 	contextName := cfg.ClusterName
 	context := api.NewContext()
 	context.Cluster = cfg.ClusterName
+	context.Namespace = cfg.Namespace
 	context.AuthInfo = userName
+	if cfg.ExtensionContext != nil {
+		context.Extensions = map[string]runtime.Object{"context_info": cfg.ExtensionContext.DeepCopy()}
+	}
+
 	apiCfg.Contexts[contextName] = context
 
 	// Only set current context to minikube if the user has not used the keepContext flag
@@ -120,20 +142,23 @@ func PopulateFromSettings(cfg *Settings, apiCfg *api.Config) error {
 // If no CurrentContext is set, the given name will be used.
 func Update(kcs *Settings) error {
 	spec := lock.PathMutexSpec(filepath.Join(kcs.filePath(), "settings.Update"))
-	glog.Infof("acquiring lock: %+v", spec)
-	releaser, err := mutex.Acquire(spec)
+	klog.Infof("acquiring lock: %+v", spec)
+	releaser, err := lock.Acquire(spec)
 	if err != nil {
-		return errors.Wrapf(err, "unable to acquire lock for %+v", spec)
+		return fmt.Errorf("unable to acquire lock for %+v: %w", spec, err)
 	}
 	defer releaser.Release()
 
 	// read existing config or create new if does not exist
-	glog.Infoln("Updating kubeconfig: ", kcs.filePath())
+	klog.Infoln("Updating kubeconfig: ", kcs.filePath())
 	kcfg, err := readOrNew(kcs.filePath())
 	if err != nil {
 		return err
 	}
 
+	ext := NewExtension()
+	kcs.ExtensionCluster = ext
+	kcs.ExtensionContext = ext
 	err = PopulateFromSettings(kcs, kcfg)
 	if err != nil {
 		return err
@@ -141,7 +166,7 @@ func Update(kcs *Settings) error {
 
 	// write back to disk
 	if err := writeToFile(kcfg, kcs.filePath()); err != nil {
-		return errors.Wrap(err, "writing kubeconfig")
+		return fmt.Errorf("writing kubeconfig: %w", err)
 	}
 	return nil
 }

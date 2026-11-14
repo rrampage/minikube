@@ -1,0 +1,32 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: netcat
+  labels:
+    app: netcat
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: netcat
+  template:
+    metadata:
+      labels:
+        app: netcat
+    spec:
+      containers:
+        # dnsutils is easier to debug DNS issues with than the standard busybox image
+        - name: dnsutils
+          # https://github.com/kubernetes/kubernetes/blob/master/test/images/agnhost/README.md
+          image: registry.k8s.io/e2e-test-images/agnhost:2.40
+          # Trap TERM so delete does not wait out the 30s grace period.
+          command: ["/bin/sh", "-c", "trap exit TERM; while true; do echo hello | nc -l -p 8080 & wait; done"]
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: node-role.kubernetes.io/master
+                    operator: NotIn
+                    values:
+                      - ""

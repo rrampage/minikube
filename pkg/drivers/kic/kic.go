@@ -17,33 +17,42 @@ limitations under the License.
 package kic
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os/exec"
+	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
-	"github.com/docker/machine/libmachine/drivers"
-	"github.com/docker/machine/libmachine/log"
-	"github.com/docker/machine/libmachine/ssh"
-	"github.com/docker/machine/libmachine/state"
-	"github.com/golang/glog"
-	"github.com/pkg/errors"
-	pkgdrivers "k8s.io/minikube/pkg/drivers"
+	"k8s.io/klog/v2"
+	"k8s.io/minikube/pkg/libmachine/drivers"
+	"k8s.io/minikube/pkg/libmachine/ssh"
+	"k8s.io/minikube/pkg/libmachine/state"
+
+	"k8s.io/minikube/pkg/drivers/common"
 	"k8s.io/minikube/pkg/drivers/kic/oci"
 	"k8s.io/minikube/pkg/minikube/assets"
 	"k8s.io/minikube/pkg/minikube/command"
 	"k8s.io/minikube/pkg/minikube/constants"
 	"k8s.io/minikube/pkg/minikube/cruntime"
 	"k8s.io/minikube/pkg/minikube/download"
-	"k8s.io/minikube/pkg/minikube/kubelet"
+	"k8s.io/minikube/pkg/minikube/driver"
+	"k8s.io/minikube/pkg/minikube/exit"
+	"k8s.io/minikube/pkg/minikube/out"
+	"k8s.io/minikube/pkg/minikube/reason"
+	"k8s.io/minikube/pkg/minikube/style"
+	"k8s.io/minikube/pkg/minikube/sysinit"
+	"k8s.io/minikube/pkg/util/retry"
 )
 
 // Driver represents a kic driver https://minikube.sigs.k8s.io/docs/reference/drivers/docker
 type Driver struct {
 	*drivers.BaseDriver
-	*pkgdrivers.CommonDriver
+	*common.CommonDriver
 	URL        string
 	exec       command.Runner
 	NodeConfig Config
@@ -66,71 +75,145 @@ func NewDriver(c Config) *Driver {
 
 // Create a host using the driver's config
 func (d *Driver) Create() error {
+	ctx := context.Background()
 	params := oci.CreateParams{
+		Mounts:        d.NodeConfig.Mounts,
 		Name:          d.NodeConfig.MachineName,
 		Image:         d.NodeConfig.ImageDigest,
 		ClusterLabel:  oci.ProfileLabelKey + "=" + d.MachineName,
 		NodeLabel:     oci.NodeLabelKey + "=" + d.NodeConfig.MachineName,
 		CPUs:          strconv.Itoa(d.NodeConfig.CPU),
-		Memory:        strconv.Itoa(d.NodeConfig.Memory) + "mb",
+		Memory:        strconv.Itoa(d.NodeConfig.Memory),
 		Envs:          d.NodeConfig.Envs,
-		ExtraArgs:     []string{"--expose", fmt.Sprintf("%d", d.NodeConfig.APIServerPort)},
+		ExtraArgs:     append([]string{"--expose", fmt.Sprintf("%d", d.NodeConfig.APIServerPort)}, d.NodeConfig.ExtraArgs...),
 		OCIBinary:     d.NodeConfig.OCIBinary,
 		APIServerPort: d.NodeConfig.APIServerPort,
+		GPUs:          d.NodeConfig.GPUs,
+	}
+	if params.Memory != "0" {
+		params.Memory += "mb"
+	}
+
+	networkName := d.NodeConfig.Network
+	if networkName == "" {
+		networkName = d.NodeConfig.ClusterName
+	}
+	staticIP := d.NodeConfig.StaticIP
+	if gateway, err := oci.CreateNetwork(d.OCIBinary, networkName, d.NodeConfig.Subnet, staticIP); err != nil {
+		msg := "Unable to create dedicated network, this might result in cluster IP change after restart: {{.error}}"
+		args := out.V{"error": err}
+		if staticIP != "" {
+			exit.Message(reason.IfDedicatedNetwork, msg, args)
+		}
+		out.WarningT(msg, args)
+	} else if gateway != nil && staticIP != "" {
+		params.Network = networkName
+		params.IP = staticIP
+	} else if gateway != nil {
+		params.Network = networkName
+		ip := gateway.To4()
+		// calculate the container IP based on guessing the machine index
+		index := driver.IndexFromMachineName(d.NodeConfig.MachineName)
+		if int(ip[3])+index > 253 { // reserve last client ip address for multi-control-plane loadbalancer vip address in ha cluster
+			return errors.New("too many machines to calculate an IP")
+		}
+		ip[3] += byte(index)
+		klog.Infof("calculated static IP %q for the %q container", ip.String(), d.NodeConfig.MachineName)
+		params.IP = ip.String()
+	}
+	drv := d.DriverName()
+
+	listAddr := oci.DefaultBindIPV4
+	if d.NodeConfig.ListenAddress != "" && d.NodeConfig.ListenAddress != listAddr {
+		out.Step(style.Tip, "minikube is not meant for production use. You are opening non-local traffic")
+		out.WarningT("Listening to {{.listenAddr}}. This is not recommended and can cause a security vulnerability. Use at your own risk",
+			out.V{"listenAddr": d.NodeConfig.ListenAddress})
+		listAddr = d.NodeConfig.ListenAddress
+	} else if oci.IsExternalDaemonHost(drv) {
+		out.WarningT("Listening to 0.0.0.0 on external docker host {{.host}}. Please be advised",
+			out.V{"host": oci.DaemonHost(drv)})
+		listAddr = "0.0.0.0"
 	}
 
 	// control plane specific options
-	params.PortMappings = append(params.PortMappings, oci.PortMapping{
-		ListenAddress: oci.DefaultBindIPV4,
-		ContainerPort: int32(params.APIServerPort),
-	},
+	params.PortMappings = append(params.PortMappings,
 		oci.PortMapping{
-			ListenAddress: oci.DefaultBindIPV4,
+			ListenAddress: listAddr,
+			ContainerPort: int32(params.APIServerPort),
+		},
+		oci.PortMapping{
+			ListenAddress: listAddr,
 			ContainerPort: constants.SSHPort,
 		},
 		oci.PortMapping{
-			ListenAddress: oci.DefaultBindIPV4,
+			ListenAddress: listAddr,
 			ContainerPort: constants.DockerDaemonPort,
+		},
+		oci.PortMapping{
+			ListenAddress: listAddr,
+			ContainerPort: constants.RegistryAddonPort,
+		},
+		oci.PortMapping{
+			ListenAddress: listAddr,
+			ContainerPort: constants.AutoPauseProxyPort,
 		},
 	)
 
-	exists, err := oci.ContainerExists(d.OCIBinary, params.Name)
+	exists, err := oci.ContainerExists(d.OCIBinary, params.Name, true)
 	if err != nil {
-		glog.Warningf("failed to check if container already exists: %v", err)
+		klog.Warningf("failed to check if container already exists: %v", err)
 	}
 	if exists {
 		// if container was created by minikube it is safe to delete and recreate it.
 		if oci.IsCreatedByMinikube(d.OCIBinary, params.Name) {
-			glog.Info("Found already existing abandoned minikube container, will try to delete.")
-			if err := oci.DeleteContainer(d.OCIBinary, params.Name); err != nil {
-				glog.Errorf("Failed to delete a conflicting minikube container %s. You might need to restart your %s daemon and delete it manually and try again: %v", params.Name, params.OCIBinary, err)
+			klog.Info("Found already existing abandoned minikube container, will try to delete.")
+			if err := oci.DeleteContainer(ctx, d.OCIBinary, params.Name); err != nil {
+				klog.Errorf("Failed to delete a conflicting minikube container %s. You might need to restart your %s daemon and delete it manually and try again: %v", params.Name, params.OCIBinary, err)
 			}
 		} else {
 			// The conflicting container name was not created by minikube
 			// user has a container that conflicts with minikube profile name, will not delete users container.
-			return errors.Wrapf(err, "user has a conflicting container name %q with minikube container. Needs to be deleted by user's consent.", params.Name)
+			return fmt.Errorf("user has a conflicting container name %q with minikube container. Needs to be deleted by user's consent: %w", params.Name, err)
 		}
 	}
 
+	if err := oci.PrepareContainerNode(params); err != nil {
+		return fmt.Errorf("setting up container node: %w", err)
+	}
+
+	var waitForPreload sync.WaitGroup
+	waitForPreload.Add(1)
+	var pErr error
+	go func() {
+		defer waitForPreload.Done()
+		// If preload doesn't exist, don't bother extracting tarball to volume
+		if !download.PreloadExists(d.NodeConfig.KubernetesVersion, d.NodeConfig.ContainerRuntime, d.DriverName()) {
+			return
+		}
+		t := time.Now()
+		klog.Infof("Starting extracting preloaded images to volume ...")
+		// Extract preloaded images to container
+		if err := oci.ExtractTarballToVolume(d.NodeConfig.OCIBinary, download.TarballPath(d.NodeConfig.KubernetesVersion, d.NodeConfig.ContainerRuntime), params.Name, d.NodeConfig.ImageDigest); err != nil {
+			if strings.Contains(err.Error(), "No space left on device") {
+				pErr = oci.ErrInsufficientDockerStorage
+				return
+			}
+			klog.Infof("Unable to extract preloaded tarball to volume: %v", err)
+		} else {
+			klog.Infof("duration metric: took %s to extract preloaded images to volume ...", time.Since(t))
+		}
+	}()
+	waitForPreload.Wait()
+	if pErr == oci.ErrInsufficientDockerStorage {
+		return pErr
+	}
+
 	if err := oci.CreateContainerNode(params); err != nil {
-		return errors.Wrap(err, "create kic node")
+		return fmt.Errorf("create kic node: %w", err)
 	}
 
 	if err := d.prepareSSH(); err != nil {
-		return errors.Wrap(err, "prepare kic ssh")
-	}
-
-	// If preload doesn't exist, don't bother extracting tarball to volume
-	if !download.PreloadExists(d.NodeConfig.KubernetesVersion, d.NodeConfig.ContainerRuntime) {
-		return nil
-	}
-	t := time.Now()
-	glog.Infof("Starting extracting preloaded images to volume")
-	// Extract preloaded images to container
-	if err := oci.ExtractTarballToVolume(download.TarballPath(d.NodeConfig.KubernetesVersion, d.NodeConfig.ContainerRuntime), params.Name, BaseImage); err != nil {
-		glog.Infof("Unable to extract preloaded tarball to volume: %v", err)
-	} else {
-		glog.Infof("Took %f seconds to extract preloaded images to volume", time.Since(t).Seconds())
+		return fmt.Errorf("prepare kic ssh: %w", err)
 	}
 
 	return nil
@@ -139,21 +222,62 @@ func (d *Driver) Create() error {
 // prepareSSH will generate keys and copy to the container so minikube ssh works
 func (d *Driver) prepareSSH() error {
 	keyPath := d.GetSSHKeyPath()
-	glog.Infof("Creating ssh key for kic: %s...", keyPath)
+	klog.Infof("Creating ssh key for kic: %s...", keyPath)
 	if err := ssh.GenerateSSHKey(keyPath); err != nil {
-		return errors.Wrap(err, "generate ssh key")
+		return fmt.Errorf("generate ssh key: %w", err)
 	}
 
 	cmder := command.NewKICRunner(d.NodeConfig.MachineName, d.NodeConfig.OCIBinary)
 	f, err := assets.NewFileAsset(d.GetSSHKeyPath()+".pub", "/home/docker/.ssh/", "authorized_keys", "0644")
 	if err != nil {
-		return errors.Wrap(err, "create pubkey assetfile ")
+		return fmt.Errorf("create pubkey assetfile : %w", err)
 	}
+	defer func() {
+		if err := f.Close(); err != nil {
+			klog.Warningf("error closing the file %s: %v", f.GetSourcePath(), err)
+		}
+	}()
+
 	if err := cmder.Copy(f); err != nil {
-		return errors.Wrap(err, "copying pub key")
+		return fmt.Errorf("copying pub key: %w", err)
 	}
+
+	// Double-check that the container has not crashed so that we may give a better error message
+	s, err := oci.ContainerStatus(d.NodeConfig.OCIBinary, d.MachineName)
+	if err != nil {
+		return err
+	}
+
+	if s != state.Running {
+		excerpt := oci.LogContainerDebug(d.OCIBinary, d.MachineName)
+		return fmt.Errorf("container name %q state %s: log: %s: %w", d.MachineName, s, excerpt, oci.ErrExitedUnexpectedly)
+	}
+
 	if rr, err := cmder.RunCmd(exec.Command("chown", "docker:docker", "/home/docker/.ssh/authorized_keys")); err != nil {
-		return errors.Wrapf(err, "apply authorized_keys file ownership, output %s", rr.Output())
+		return fmt.Errorf("apply authorized_keys file ownership, output %s: %w", rr.Output(), err)
+	}
+
+	if runtime.GOOS == "windows" {
+		path, _ := exec.LookPath("powershell")
+		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+		defer cancel()
+
+		klog.Infof("ensuring only current user has permissions to key file located at : %s...", keyPath)
+
+		// Get the SID of the current user
+		currentUserSidCmd := exec.CommandContext(ctx, path, "-NoProfile", "-NonInteractive", "([System.Security.Principal.WindowsIdentity]::GetCurrent()).User.Value")
+		currentUserSidOut, currentUserSidErr := currentUserSidCmd.CombinedOutput()
+		if currentUserSidErr != nil {
+			klog.Warningf("unable to determine current user's SID. minikube tunnel may not work.")
+		} else {
+			icaclsArguments := fmt.Sprintf(`"%s" /grant:r *%s:F /inheritancelevel:r`, keyPath, strings.TrimSpace(string(currentUserSidOut)))
+			icaclsCmd := exec.CommandContext(ctx, path, "-NoProfile", "-NonInteractive", "icacls.exe", icaclsArguments)
+			icaclsCmdOut, icaclsCmdErr := icaclsCmd.CombinedOutput()
+
+			if icaclsCmdErr != nil {
+				return fmt.Errorf("%s: %w", fmt.Sprintf("unable to execute icacls to set permissions: %s", icaclsCmdOut), icaclsCmdErr)
+			}
+		}
 	}
 
 	return nil
@@ -173,21 +297,21 @@ func (d *Driver) GetIP() (string, error) {
 	return ip, err
 }
 
-// GetExternalIP returns an IP which is accissble from outside
+// GetExternalIP returns an IP which is accessible from outside
 func (d *Driver) GetExternalIP() (string, error) {
-	return oci.DefaultBindIPV4, nil
+	return oci.DaemonHost(d.DriverName()), nil
 }
 
 // GetSSHHostname returns hostname for use with ssh
 func (d *Driver) GetSSHHostname() (string, error) {
-	return oci.DefaultBindIPV4, nil
+	return oci.DaemonHost(d.DriverName()), nil
 }
 
 // GetSSHPort returns port for use with ssh
 func (d *Driver) GetSSHPort() (int, error) {
 	p, err := oci.ForwardedPort(d.OCIBinary, d.MachineName, constants.SSHPort)
 	if err != nil {
-		return p, errors.Wrap(err, "get ssh host-port")
+		return p, fmt.Errorf("get ssh host-port: %w", err)
 	}
 	return p, nil
 }
@@ -219,38 +343,24 @@ func (d *Driver) GetURL() (string, error) {
 
 // GetState returns the state that the host is in (running, stopped, etc)
 func (d *Driver) GetState() (state.State, error) {
-	out, err := oci.WarnIfSlow(d.NodeConfig.OCIBinary, "inspect", "-f", "{{.State.Status}}", d.MachineName)
-	if err != nil {
-		return state.Error, err
-	}
-
-	o := strings.TrimSpace(string(out))
-	switch o {
-	case "running":
-		return state.Running, nil
-	case "exited":
-		return state.Stopped, nil
-	case "paused":
-		return state.Paused, nil
-	case "restarting":
-		return state.Starting, nil
-	case "dead":
-		return state.Error, nil
-	default:
-		return state.None, fmt.Errorf("unknown state")
-	}
+	return oci.ContainerStatus(d.OCIBinary, d.MachineName, true)
 }
 
 // Kill stops a host forcefully, including any containers that we are managing.
 func (d *Driver) Kill() error {
 	// on init this doesn't get filled when called from cmd
 	d.exec = command.NewKICRunner(d.MachineName, d.OCIBinary)
-	if err := kubelet.ForceStop(d.exec); err != nil {
-		glog.Warningf("couldn't force stop kubelet. will continue with kill anyways: %v", err)
+	if err := sysinit.New(d.exec).ForceStop("kubelet"); err != nil {
+		klog.Warningf("couldn't force stop kubelet. will continue with kill anyways: %v", err)
 	}
-	cmd := exec.Command(d.NodeConfig.OCIBinary, "kill", d.MachineName)
-	if err := cmd.Run(); err != nil {
-		return errors.Wrapf(err, "killing kic node %s", d.MachineName)
+
+	if err := oci.ShutDown(d.OCIBinary, d.MachineName); err != nil {
+		klog.Warningf("couldn't shutdown the container, will continue with kill anyways: %v", err)
+	}
+
+	cr := command.NewExecRunner(false) // using exec runner for interacting with daemon.
+	if _, err := cr.RunCmd(oci.PrefixCmd(exec.Command(d.NodeConfig.OCIBinary, "kill", d.MachineName))); err != nil {
+		return fmt.Errorf("killing %q: %w", d.MachineName, err)
 	}
 	return nil
 }
@@ -258,16 +368,26 @@ func (d *Driver) Kill() error {
 // Remove will delete the Kic Node Container
 func (d *Driver) Remove() error {
 	if _, err := oci.ContainerID(d.OCIBinary, d.MachineName); err != nil {
-		log.Warnf("could not find the container %s to remove it.", d.MachineName)
+		klog.Infof("could not find the container %s to remove it. will try anyways", d.MachineName)
 	}
-	cmd := exec.Command(d.NodeConfig.OCIBinary, "rm", "-f", "-v", d.MachineName)
-	o, err := cmd.CombinedOutput()
-	out := strings.TrimSpace(string(o))
-	if err != nil {
-		if strings.Contains(out, "is already in progress") {
-			log.Warnf("Docker engine is stuck. please restart docker daemon on your computer.", d.MachineName)
+
+	if err := oci.DeleteContainer(context.Background(), d.NodeConfig.OCIBinary, d.MachineName); err != nil {
+		if strings.Contains(err.Error(), "is already in progress") {
+			return fmt.Errorf("stuck delete: %w", err)
 		}
-		return errors.Wrapf(err, "removing container %s, output %s", d.MachineName, out)
+		if strings.Contains(err.Error(), "No such container:") {
+			return nil // nothing was found to delete.
+		}
+
+	}
+
+	// check there be no container left after delete
+	if id, err := oci.ContainerID(d.OCIBinary, d.MachineName); err == nil && id != "" {
+		return fmt.Errorf("expected no container ID be found for %q after delete. but got %q", d.MachineName, id)
+	}
+
+	if err := oci.RemoveNetwork(d.OCIBinary, d.NodeConfig.ClusterName); err != nil {
+		klog.Warningf("failed to remove network (which might be okay) %s: %v", d.NodeConfig.ClusterName, err)
 	}
 	return nil
 }
@@ -276,40 +396,51 @@ func (d *Driver) Remove() error {
 func (d *Driver) Restart() error {
 	s, err := d.GetState()
 	if err != nil {
-		return errors.Wrap(err, "get kic state")
+		klog.Warningf("get state during restart: %v", err)
 	}
-	switch s {
-	case state.Stopped:
+	if s == state.Stopped { // don't stop if already stopped
 		return d.Start()
-	case state.Running, state.Error:
-		if err = d.Stop(); err != nil {
-			return fmt.Errorf("restarting a kic stop phase %v", err)
-		}
-		if err = d.Start(); err != nil {
-			return fmt.Errorf("restarting a kic start phase %v", err)
-		}
-		return nil
 	}
-
-	return fmt.Errorf("restarted not implemented for kic state %s yet", s)
+	if err = d.Stop(); err != nil {
+		return fmt.Errorf("stop during restart %v", err)
+	}
+	if err = d.Start(); err != nil {
+		return fmt.Errorf("start during restart %v", err)
+	}
+	return nil
 }
 
-// Start a _stopped_ kic container
-// not meant to be used for Create().
+// Start an already created kic container
 func (d *Driver) Start() error {
-	s, err := d.GetState()
-	if err != nil {
-		return errors.Wrap(err, "get kic state")
-	}
-	if s == state.Stopped {
-		cmd := exec.Command(d.NodeConfig.OCIBinary, "start", d.MachineName)
-		if err := cmd.Run(); err != nil {
-			return errors.Wrapf(err, "starting a stopped kic node %s", d.MachineName)
+	if err := oci.StartContainer(d.NodeConfig.OCIBinary, d.MachineName); err != nil {
+		oci.LogContainerDebug(d.OCIBinary, d.MachineName)
+		if _, err := oci.DaemonInfo(d.OCIBinary); err != nil {
+			return fmt.Errorf("debug daemon info %q: %w", d.MachineName, oci.ErrDaemonInfo)
 		}
+		return fmt.Errorf("start: %w", err)
+	}
+	checkRunning := func() error {
+		s, err := oci.ContainerStatus(d.NodeConfig.OCIBinary, d.MachineName)
+		if err != nil {
+			return err
+		}
+		if s != state.Running {
+			return fmt.Errorf("expected container state be running but got %q", s)
+		}
+		klog.Infof("container %q state is running.", d.MachineName)
 		return nil
 	}
-	// TODO:medyagh maybe make it idempotent
-	return fmt.Errorf("cant start a not-stopped (%s) kic node", s)
+
+	if err := retry.Expo(checkRunning, 500*time.Microsecond, time.Second*30); err != nil {
+		excerpt := oci.LogContainerDebug(d.OCIBinary, d.MachineName)
+		_, err := oci.DaemonInfo(d.OCIBinary)
+		if err != nil {
+			return fmt.Errorf("container name %q: %w", d.MachineName, oci.ErrDaemonInfo)
+		}
+
+		return fmt.Errorf("container name %q: log: %s: %w", d.MachineName, excerpt, oci.ErrExitedUnexpectedly)
+	}
+	return nil
 }
 
 // Stop a host gracefully, including any containers that we are managing.
@@ -318,39 +449,63 @@ func (d *Driver) Stop() error {
 	d.exec = command.NewKICRunner(d.MachineName, d.OCIBinary)
 	// docker does not send right SIG for systemd to know to stop the systemd.
 	// to avoid bind address be taken on an upgrade. more info https://github.com/kubernetes/minikube/issues/7171
-	if err := kubelet.Stop(d.exec); err != nil {
-		glog.Warningf("couldn't stop kubelet. will continue with stop anyways: %v", err)
-		if err := kubelet.ForceStop(d.exec); err != nil {
-			glog.Warningf("couldn't force stop kubelet. will continue with stop anyways: %v", err)
+	if err := sysinit.New(d.exec).Stop("kubelet"); err != nil {
+		klog.Warningf("couldn't stop kubelet. will continue with stop anyways: %v", err)
+		if err := sysinit.New(d.exec).ForceStop("kubelet"); err != nil {
+			klog.Warningf("couldn't force stop kubelet. will continue with stop anyways: %v", err)
 		}
 	}
 
-	runtime, err := cruntime.New(cruntime.Config{Type: d.NodeConfig.ContainerRuntime, Runner: d.exec})
+	crMgr, err := cruntime.New(cruntime.Config{Type: d.NodeConfig.ContainerRuntime, Runner: d.exec})
 	if err != nil { // won't return error because:
-		// even though we can't stop the cotainers inside, we still wanna stop the minikube container itself
-		glog.Errorf("unable to get container runtime: %v", err)
+		// even though we can't stop the containers inside, we still wanna stop the minikube container itself
+		klog.Errorf("unable to get container runtime: %v", err)
 	} else {
-		containers, err := runtime.ListContainers(cruntime.ListOptions{Namespaces: constants.DefaultNamespaces})
+		containers, err := crMgr.ListContainers(cruntime.ListContainersOptions{Namespaces: constants.DefaultNamespaces})
 		if err != nil {
-			glog.Infof("unable list containers : %v", err)
+			klog.Infof("unable list containers : %v", err)
 		}
 		if len(containers) > 0 {
-			if err := runtime.StopContainers(containers); err != nil {
-				glog.Errorf("unable to stop containers : %v", err)
+			if err := crMgr.StopContainers(containers); err != nil {
+				klog.Infof("unable to stop containers : %v", err)
+			}
+			if err := crMgr.KillContainers(containers); err != nil {
+				klog.Errorf("unable to kill containers : %v", err)
 			}
 		}
-		glog.Infof("successfully stopped kubernetes!")
+		klog.Infof("successfully stopped kubernetes!")
 
+	}
+
+	if err := killAPIServerProc(d.exec); err != nil {
+		klog.Warningf("couldn't stop kube-apiserver proc: %v", err)
 	}
 
 	cmd := exec.Command(d.NodeConfig.OCIBinary, "stop", d.MachineName)
 	if err := cmd.Run(); err != nil {
-		return errors.Wrapf(err, "stopping %s", d.MachineName)
+		return fmt.Errorf("stopping %s: %w", d.MachineName, err)
 	}
 	return nil
 }
 
 // RunSSHCommandFromDriver implements direct ssh control to the driver
 func (d *Driver) RunSSHCommandFromDriver() error {
-	return fmt.Errorf("driver does not support RunSSHCommandFromDriver commands")
+	return errors.New("driver does not support RunSSHCommandFromDriver commands")
+}
+
+// killAPIServerProc will kill an api server proc if it exists
+// to ensure this never happens https://github.com/kubernetes/minikube/issues/7521
+func killAPIServerProc(runner command.Runner) error {
+	// first check if it exists
+	rr, err := runner.RunCmd(exec.Command("pgrep", "kube-apiserver"))
+	if err == nil { // this means we might have a running kube-apiserver
+		pid, err := strconv.Atoi(rr.Stdout.String())
+		if err == nil { // this means we have a valid pid
+			klog.Warningf("Found a kube-apiserver running with pid %d, will try to kill the proc", pid)
+			if _, err = runner.RunCmd(exec.Command("pkill", "-9", fmt.Sprint(pid))); err != nil {
+				return fmt.Errorf("kill: %w", err)
+			}
+		}
+	}
+	return nil
 }

@@ -16,6 +16,14 @@ limitations under the License.
 
 package oci
 
+import (
+	"errors"
+	"fmt"
+	"path"
+	"regexp"
+	"strings"
+)
+
 const (
 	// DefaultBindIPV4 is The default IP the container will listen on.
 	DefaultBindIPV4 = "127.0.0.1"
@@ -31,23 +39,29 @@ const (
 	nodeRoleLabelKey = "role.minikube.sigs.k8s.io"
 	// CreatedByLabelKey is applied to any container/volume that is created by minikube created_by.minikube.sigs.k8s.io=true
 	CreatedByLabelKey = "created_by.minikube.sigs.k8s.io"
+	// NoLimit is the value that specifies that no resource limit should be set
+	NoLimit = "0"
 )
 
 // CreateParams are parameters needed to create a container
 type CreateParams struct {
+	ClusterName   string            // cluster(profile name) that this container belongs to
 	Name          string            // used for container name and hostname
 	Image         string            // container image to use to create the node.
 	ClusterLabel  string            // label the clusters we create using minikube so we can clean up
 	NodeLabel     string            // label the nodes so we can clean up by node name
 	Role          string            // currently only role supported is control-plane
 	Mounts        []Mount           // volume mounts
-	APIServerPort int               // kubernetes api server port
+	APIServerPort int               // Kubernetes api server port
 	PortMappings  []PortMapping     // ports to map to container from host
 	CPUs          string            // number of cpu cores assign to container
 	Memory        string            // memory (mbs) to assign to the container
 	Envs          map[string]string // environment variables to pass to the container
 	ExtraArgs     []string          // a list of any extra option to pass to oci binary during creation time, for example --expose 8080...
 	OCIBinary     string            // docker or podman
+	Network       string            // network name that the container will attach to
+	IP            string            // static IP to assign the container in the cluster network
+	GPUs          string            // add GPU devices to the container
 }
 
 // createOpt is an option for Create
@@ -73,11 +87,13 @@ https://github.com/kubernetes/kubernetes/blob/063e7ff358fdc8b0916e6f39beedc0d025
 // names on disk as opposed to the int32 values, and the serlialzed field names
 // have been made closer to core/v1 VolumeMount field names
 // In yaml this looks like:
-//  containerPath: /foo
-//  hostPath: /bar
-//  readOnly: true
-//  selinuxRelabel: false
-//  propagation: None
+//
+//	containerPath: /foo
+//	hostPath: /bar
+//	readOnly: true
+//	selinuxRelabel: false
+//	propagation: None
+//
 // Propagation may be one of: None, HostToContainer, Bidirectional
 type Mount struct {
 	// Path of the mount within the container.
@@ -94,11 +110,63 @@ type Mount struct {
 	Propagation MountPropagation `protobuf:"varint,5,opt,name=propagation,proto3,enum=runtime.v1alpha2.MountPropagation" json:"propagation,omitempty"`
 }
 
+// ParseMountString parses a mount string of format:
+// '[host-path:]container-path[:<options>]' The comma-delimited 'options' are
+// [rw|ro], [Z], [srhared|rslave|rprivate].
+func ParseMountString(spec string) (m Mount, err error) {
+	f := strings.Split(spec, ":")
+	fields := f
+	// suppressing err is safe here since the regex will always compile
+	windows, _ := regexp.MatchString(`^[A-Z]:\\*`, spec)
+	if windows {
+		// Recreate the host path that got split above since
+		// Windows paths look like C:\path
+		hpath := fmt.Sprintf("%s:%s", f[0], f[1])
+		fields = []string{hpath}
+		fields = append(fields, f[2:]...)
+	}
+	switch len(fields) {
+	case 0:
+		err = errors.New("invalid empty spec")
+	case 1:
+		m.ContainerPath = fields[0]
+	case 3:
+		for opt := range strings.SplitSeq(fields[2], ",") {
+			switch opt {
+			case "Z":
+				m.SelinuxRelabel = true
+			case "ro":
+				m.Readonly = true
+			case "rw":
+				m.Readonly = false
+			case "rslave":
+				m.Propagation = MountPropagationHostToContainer
+			case "rshared":
+				m.Propagation = MountPropagationBidirectional
+			case "private":
+				m.Propagation = MountPropagationNone
+			default:
+				err = fmt.Errorf("unknown mount option: '%s'", opt)
+			}
+		}
+		fallthrough
+	case 2:
+		m.HostPath, m.ContainerPath = fields[0], fields[1]
+		if !path.IsAbs(m.ContainerPath) {
+			err = fmt.Errorf("'%s' container path must be absolute", m.ContainerPath)
+		}
+	default:
+		err = errors.New("spec must be in form: <host path>:<container path>[:<options>]")
+	}
+	return m, err
+}
+
 // PortMapping specifies a host port mapped into a container port.
 // In yaml this looks like:
-//  containerPort: 80
-//  hostPort: 8000
-//  listenAddress: 127.0.0.1
+//
+//	containerPort: 80
+//	hostPort: 8000
+//	listenAddress: 127.0.0.1
 type PortMapping struct {
 	// Port within the container.
 	ContainerPort int32 `protobuf:"varint,1,opt,name=container_port,json=containerPort,proto3" json:"containerPort,omitempty"`
@@ -124,7 +192,7 @@ const (
 	MountPropagationBidirectional MountPropagation = 2
 )
 
-// MountPropagationValueToName is a map of valid MountPropogation values to
+// MountPropagationValueToName is a map of valid MountPropagation values to
 // their string names
 var MountPropagationValueToName = map[MountPropagation]string{
 	MountPropagationNone:            "None",
@@ -132,7 +200,7 @@ var MountPropagationValueToName = map[MountPropagation]string{
 	MountPropagationBidirectional:   "Bidirectional",
 }
 
-// MountPropagationNameToValue is a map of valid MountPropogation names to
+// MountPropagationNameToValue is a map of valid MountPropagation names to
 // their values
 var MountPropagationNameToValue = map[string]MountPropagation{
 	"None":            MountPropagationNone,

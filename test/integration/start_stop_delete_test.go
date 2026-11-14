@@ -1,4 +1,4 @@
-// +build integration
+//go:build integration
 
 /*
 Copyright 2016 The Kubernetes Authors All rights reserved.
@@ -29,12 +29,17 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/docker/machine/libmachine/state"
+	"github.com/blang/semver/v4"
 	"github.com/google/go-cmp/cmp"
+	"k8s.io/minikube/pkg/libmachine/state"
 	"k8s.io/minikube/pkg/minikube/bootstrapper/images"
 	"k8s.io/minikube/pkg/minikube/constants"
+	"k8s.io/minikube/pkg/minikube/detect"
+	"k8s.io/minikube/pkg/util"
 )
 
+// TestStartStop tests starting, stopping and restarting a minikube clusters with various Kubernetes versions and configurations
+// The oldest supported, newest supported and default Kubernetes versions are always tested.
 func TestStartStop(t *testing.T) {
 	MaybeParallel(t)
 
@@ -44,30 +49,25 @@ func TestStartStop(t *testing.T) {
 			version string
 			args    []string
 		}{
-			{"old-docker", constants.OldestKubernetesVersion, []string{
+			{"old-k8s-version", constants.OldestKubernetesVersion, []string{
 				// default is the network created by libvirt, if we change the name minikube won't boot
 				// because the given network doesn't exist
 				"--kvm-network=default",
 				"--kvm-qemu-uri=qemu:///system",
 				"--disable-driver-mounts",
 				"--keep-context=false",
-				"--container-runtime=docker",
 			}},
 			{"newest-cni", constants.NewestKubernetesVersion, []string{
-				"--feature-gates",
-				"ServerSideApply=true",
 				"--network-plugin=cni",
-				"--extra-config=kubelet.network-plugin=cni",
-				"--extra-config=kubeadm.pod-network-cidr=192.168.111.111/16",
+				"--extra-config=kubeadm.pod-network-cidr=10.42.0.0/16",
 			}},
-			{"containerd", constants.DefaultKubernetesVersion, []string{
-				"--container-runtime=containerd",
-				"--docker-opt",
-				"containerd=/var/run/containerd/containerd.sock",
+			{"default-k8s-diff-port", constants.DefaultKubernetesVersion, []string{
 				"--apiserver-port=8444",
 			}},
-			{"crio", "v1.15.7", []string{
-				"--container-runtime=crio",
+			{"no-preload", constants.NewestKubernetesVersion, []string{
+				"--preload=false",
+			}},
+			{"disable-driver-mounts", constants.DefaultKubernetesVersion, []string{
 				"--disable-driver-mounts",
 				"--extra-config=kubeadm.ignore-preflight-errors=SystemVerification",
 			}},
@@ -76,149 +76,248 @@ func TestStartStop(t *testing.T) {
 			}},
 		}
 
+		if detect.IsCloudShell() {
+			tests = []struct {
+				name    string
+				version string
+				args    []string
+			}{
+				{"cloud-shell", constants.DefaultKubernetesVersion, []string{}},
+			}
+		}
+
 		for _, tc := range tests {
 			tc := tc
 			t.Run(tc.name, func(t *testing.T) {
 				MaybeParallel(t)
-
+				MaybeSkipDockerRuntime(t, tc.version)
+				profile := UniqueProfileName(tc.name)
+				ctx, cancel := context.WithTimeout(context.Background(), Minutes(30))
+				defer Cleanup(t, profile, cancel)
+				type validateStartStopFunc func(context.Context, *testing.T, string, string, string, []string)
 				if !strings.Contains(tc.name, "docker") && NoneDriver() {
 					t.Skipf("skipping %s - incompatible with none driver", t.Name())
 				}
+				if strings.Contains(tc.name, "disable-driver-mounts") && !VirtualboxDriver() {
+					t.Skipf("skipping %s - only runs on virtualbox", t.Name())
+				}
 
-				profile := UniqueProfileName(tc.name)
-				ctx, cancel := context.WithTimeout(context.Background(), Minutes(40))
-				defer CleanupWithLogs(t, profile, cancel)
+				waitFlag := "--wait=true"
+				if strings.Contains(tc.name, "cni") { // wait=app_running is broken for CNI https://github.com/kubernetes/minikube/issues/7354
+					waitFlag = "--wait=apiserver,system_pods,default_sa"
+				}
 
-				startArgs := append([]string{"start", "-p", profile, "--memory=2200", "--alsologtostderr", "-v=3", "--wait=true"}, tc.args...)
+				startArgs := append([]string{"start", "-p", profile, "--memory=3072", "--alsologtostderr", waitFlag}, tc.args...)
 				startArgs = append(startArgs, StartArgs()...)
 				startArgs = append(startArgs, fmt.Sprintf("--kubernetes-version=%s", tc.version))
 
-				rr, err := Run(t, exec.CommandContext(ctx, Target(), startArgs...))
+				version, err := util.ParseKubernetesVersion(tc.version)
 				if err != nil {
-					t.Fatalf("failed starting minikube -first start-. args %q: %v", rr.Command(), err)
+					t.Errorf("failed to parse %s: %v", tc.version, err)
 				}
-
-				if !strings.Contains(tc.name, "cni") {
-					testPodScheduling(ctx, t, profile)
-				}
-
-				rr, err = Run(t, exec.CommandContext(ctx, Target(), "stop", "-p", profile, "--alsologtostderr", "-v=3"))
-				if err != nil {
-					t.Errorf("failed stopping minikube - first stop-. args %q : %v", rr.Command(), err)
-				}
-
-				// The none driver never really stops
-				if !NoneDriver() {
-					got := Status(ctx, t, Target(), profile, "Host")
-					if got != state.Stopped.String() {
-						t.Errorf("expected post-stop host status to be -%q- but got *%q*", state.Stopped, got)
+				if version.GTE(semver.MustParse("1.24.0-alpha.2")) {
+					args := []string{}
+					for _, arg := range startArgs {
+						if arg == "--extra-config=kubelet.network-plugin=cni" {
+							continue
+						}
+						args = append(args, arg)
 					}
+					startArgs = args
 				}
 
-				// Enable an addon to assert it comes up afterwards
-				rr, err = Run(t, exec.CommandContext(ctx, Target(), "addons", "enable", "dashboard", "-p", profile))
-				if err != nil {
-					t.Errorf("failed to enable an addon post-stop. args %q: %v", rr.Command(), err)
-				}
-
-				rr, err = Run(t, exec.CommandContext(ctx, Target(), startArgs...))
-				if err != nil {
-					// Explicit fatal so that failures don't move directly to deletion
-					t.Fatalf("failed to start minikube post-stop. args %q: %v", rr.Command(), err)
-				}
-
-				if strings.Contains(tc.name, "cni") {
-					t.Logf("WARNING: cni mode requires additional setup before pods can schedule :(")
-				} else {
-					if _, err := PodWait(ctx, t, profile, "default", "integration-test=busybox", Minutes(4)); err != nil {
-						t.Fatalf("failed waiting for pod 'busybox' post-stop-start: %v", err)
+				t.Run("serial", func(t *testing.T) {
+					serialTests := []struct {
+						name      string
+						validator validateStartStopFunc
+					}{
+						{"FirstStart", validateFirstStart},
+						{"DeployApp", validateDeploying},
+						{"EnableAddonWhileActive", validateEnableAddonWhileActive},
+						{"Stop", validateStop},
+						{"EnableAddonAfterStop", validateEnableAddonAfterStop},
+						{"SecondStart", validateSecondStart},
+						{"UserAppExistsAfterStop", validateAppExistsAfterStop},
+						{"AddonExistsAfterStop", validateAddonAfterStop},
+						{"VerifyKubernetesImages", validateKubernetesImages},
+						{"Pause", validatePauseAfterStart},
 					}
-					if _, err := PodWait(ctx, t, profile, "kubernetes-dashboard", "k8s-app=kubernetes-dashboard", Minutes(4)); err != nil {
-						t.Fatalf("failed waiting for 'addon dashboard' pod post-stop-start: %v", err)
-					}
-				}
+					for _, stc := range serialTests {
+						if ctx.Err() == context.DeadlineExceeded {
+							t.Fatalf("Unable to run more tests (deadline exceeded)")
+						}
 
-				got := Status(ctx, t, Target(), profile, "Host")
-				if got != state.Running.String() {
-					t.Errorf("expected host status after start-stop-start to be -%q- but got *%q*", state.Running, got)
-				}
+						tcName := tc.name
+						tcVersion := tc.version
+						stc := stc
 
-				if !NoneDriver() {
-					testPulledImages(ctx, t, profile, tc.version)
-				}
-
-				testPause(ctx, t, profile)
-
-				if *cleanup {
-					// Normally handled by cleanuprofile, but not fatal there
-					rr, err = Run(t, exec.CommandContext(ctx, Target(), "delete", "-p", profile))
-					if err != nil {
-						t.Errorf("failed to clean up: args %q: %v", rr.Command(), err)
+						t.Run(stc.name, func(t *testing.T) {
+							stc.validator(ctx, t, profile, tcName, tcVersion, startArgs)
+						})
 					}
 
-					rr, err = Run(t, exec.CommandContext(ctx, "kubectl", "config", "get-contexts", profile))
-					if err != nil {
-						t.Logf("config context error: %v (may be ok)", err)
+					if *cleanup {
+						// Normally handled by cleanuprofile, but not fatal there
+						rr, err := Run(t, exec.CommandContext(ctx, Target(), "delete", "-p", profile))
+						if err != nil {
+							t.Errorf("failed to clean up: args %q: %v", rr.Command(), err)
+						}
+
+						rr, err = Run(t, exec.CommandContext(ctx, KubectlBinary(), "config", "get-contexts", profile))
+						if err != nil {
+							t.Logf("config context error: %v (may be ok)", err)
+						}
+						if rr.ExitCode != 1 {
+							t.Errorf("expected exit code 1, got %d. output: %s", rr.ExitCode, rr.Output())
+						}
 					}
-					if rr.ExitCode != 1 {
-						t.Errorf("expected exit code 1, got %d. output: %s", rr.ExitCode, rr.Output())
-					}
-				}
+
+				})
+
 			})
 		}
 	})
 }
 
-func TestStartStopWithPreload(t *testing.T) {
-	if NoneDriver() {
-		t.Skipf("skipping %s - incompatible with none driver", t.Name())
-	}
-
-	profile := UniqueProfileName("test-preload")
-	ctx, cancel := context.WithTimeout(context.Background(), Minutes(40))
-	defer CleanupWithLogs(t, profile, cancel)
-
-	startArgs := []string{"start", "-p", profile, "--memory=2200", "--alsologtostderr", "-v=3", "--wait=true", "--preload=false"}
-	startArgs = append(startArgs, StartArgs()...)
-	k8sVersion := "v1.17.0"
-	startArgs = append(startArgs, fmt.Sprintf("--kubernetes-version=%s", k8sVersion))
-
+// validateFirstStart runs the initial minikube start
+func validateFirstStart(ctx context.Context, t *testing.T, profile, _, _ string, startArgs []string) {
+	defer PostMortemLogs(t, profile)
 	rr, err := Run(t, exec.CommandContext(ctx, Target(), startArgs...))
 	if err != nil {
-		t.Fatalf("%s failed: %v", rr.Command(), err)
+		t.Fatalf("failed starting minikube -first start-. args %q: %v", rr.Command(), err)
+	}
+}
+
+// validateDeploying deploys an app the minikube cluster
+func validateDeploying(ctx context.Context, t *testing.T, profile, tcName, _ string, _ []string) {
+	defer PostMortemLogs(t, profile)
+	if !strings.Contains(tcName, "cni") {
+		testPodScheduling(ctx, t, profile)
+	}
+}
+
+// validateEnableAddonWhileActive makes sure addons can be enabled while cluster is active.
+func validateEnableAddonWhileActive(ctx context.Context, t *testing.T, profile, tcName, _ string, _ []string) {
+	defer PostMortemLogs(t, profile)
+
+	// Enable an addon to assert it requests the correct image.
+	rr, err := Run(t, exec.CommandContext(ctx, Target(), "addons", "enable", "metrics-server", "-p", profile, "--images=MetricsServer=registry.k8s.io/echoserver:1.4", "--registries=MetricsServer=fake.domain"))
+	if err != nil {
+		t.Errorf("failed to enable an addon post-stop. args %q: %v", rr.Command(), err)
 	}
 
-	// Now, pull the busybox image into the VMs docker daemon
-	image := "busybox"
-	rr, err = Run(t, exec.CommandContext(ctx, Target(), "ssh", "-p", profile, "--", "docker", "pull", image))
-	if err != nil {
-		t.Fatalf("%s failed: %v", rr.Command(), err)
+	if strings.Contains(tcName, "cni") {
+		t.Logf("WARNING: cni mode requires additional setup before pods can schedule :(")
+		return
 	}
 
-	// Restart minikube with v1.17.3, which has a preloaded tarball
-	startArgs = []string{"start", "-p", profile, "--memory=2200", "--alsologtostderr", "-v=3", "--wait=true"}
-	startArgs = append(startArgs, StartArgs()...)
-	k8sVersion = "v1.17.3"
-	startArgs = append(startArgs, fmt.Sprintf("--kubernetes-version=%s", k8sVersion))
-	rr, err = Run(t, exec.CommandContext(ctx, Target(), startArgs...))
+	rr, err = Run(t, exec.CommandContext(ctx, KubectlBinary(), "--context", profile, "describe", "deploy/metrics-server", "-n", "kube-system"))
 	if err != nil {
-		t.Fatalf("%s failed: %v", rr.Command(), err)
+		t.Errorf("failed to get info on auto-pause deployments. args %q: %v", rr.Command(), err)
 	}
-	rr, err = Run(t, exec.CommandContext(ctx, Target(), "ssh", "-p", profile, "--", "docker", "images"))
+	deploymentInfo := rr.Stdout.String()
+	if !strings.Contains(deploymentInfo, " fake.domain/registry.k8s.io/echoserver:1.4") {
+		t.Errorf("addon did not load correct image. Expected to contain \" fake.domain/registry.k8s.io/echoserver:1.4\". Addon deployment info: %s", deploymentInfo)
+	}
+}
+
+// validateStop tests minikube stop
+func validateStop(ctx context.Context, t *testing.T, profile, _, _ string, _ []string) {
+	defer PostMortemLogs(t, profile)
+	rr, err := Run(t, exec.CommandContext(ctx, Target(), "stop", "-p", profile, "--alsologtostderr", "-v=3"))
 	if err != nil {
-		t.Fatalf("%s failed: %v", rr.Command(), err)
+		t.Fatalf("failed stopping minikube - first stop-. args %q : %v", rr.Command(), err)
 	}
-	if !strings.Contains(rr.Output(), image) {
-		t.Fatalf("Expected to find %s in output of `docker images`, instead got %s", image, rr.Output())
+}
+
+// validateEnableAddonAfterStop makes sure addons can be enabled on a stopped cluster
+func validateEnableAddonAfterStop(ctx context.Context, t *testing.T, profile, _, _ string, _ []string) {
+	defer PostMortemLogs(t, profile)
+	// The none driver never really stops
+	if !NoneDriver() {
+		got := Status(ctx, t, Target(), profile, "Host", profile)
+		if got != state.Stopped.String() {
+			t.Errorf("expected post-stop host status to be -%q- but got *%q*", state.Stopped, got)
+		}
 	}
+
+	// Enable an addon to assert it comes up afterwards
+	rr, err := Run(t, exec.CommandContext(ctx, Target(), "addons", "enable", "dashboard", "-p", profile, "--images=MetricsScraper=registry.k8s.io/echoserver:1.4"))
+	if err != nil {
+		t.Errorf("failed to enable an addon post-stop. args %q: %v", rr.Command(), err)
+	}
+
+}
+
+// validateSecondStart verifies that starting a stopped cluster works
+func validateSecondStart(ctx context.Context, t *testing.T, profile, _, _ string, startArgs []string) {
+	defer PostMortemLogs(t, profile)
+	rr, err := Run(t, exec.CommandContext(ctx, Target(), startArgs...))
+	if err != nil {
+		// Explicit fatal so that failures don't move directly to deletion
+		t.Fatalf("failed to start minikube post-stop. args %q: %v", rr.Command(), err)
+	}
+
+	got := Status(ctx, t, Target(), profile, "Host", profile)
+	if got != state.Running.String() {
+		t.Errorf("expected host status after start-stop-start to be -%q- but got *%q*", state.Running, got)
+	}
+
+}
+
+// validateAppExistsAfterStop verifies that a user's app will not vanish after a minikube stop
+func validateAppExistsAfterStop(ctx context.Context, t *testing.T, profile, tcName, _ string, _ []string) {
+	defer PostMortemLogs(t, profile)
+	if strings.Contains(tcName, "cni") {
+		t.Logf("WARNING: cni mode requires additional setup before pods can schedule :(")
+	} else if _, err := PodWait(ctx, t, profile, "kubernetes-dashboard", "k8s-app=kubernetes-dashboard", Minutes(9)); err != nil {
+		t.Errorf("failed waiting for 'addon dashboard' pod post-stop-start: %v", err)
+	}
+
+}
+
+// validateAddonAfterStop validates that an addon which was enabled when minikube is stopped will be enabled and working..
+func validateAddonAfterStop(ctx context.Context, t *testing.T, profile, tcName, _ string, _ []string) {
+	defer PostMortemLogs(t, profile)
+	if strings.Contains(tcName, "cni") {
+		t.Logf("WARNING: cni mode requires additional setup before pods can schedule :(")
+		return
+	}
+	if _, err := PodWait(ctx, t, profile, "kubernetes-dashboard", "k8s-app=kubernetes-dashboard", Minutes(9)); err != nil {
+		t.Errorf("failed waiting for 'addon dashboard' pod post-stop-start: %v", err)
+	}
+
+	rr, err := Run(t, exec.CommandContext(ctx, KubectlBinary(), "--context", profile, "describe", "deploy/dashboard-metrics-scraper", "-n", "kubernetes-dashboard"))
+	if err != nil {
+		t.Errorf("failed to get info on kubernetes-dashboard deployments. args %q: %v", rr.Command(), err)
+	}
+	deploymentInfo := rr.Stdout.String()
+	if !strings.Contains(deploymentInfo, " registry.k8s.io/echoserver:1.4") {
+		t.Errorf("addon did not load correct image. Expected to contain \" registry.k8s.io/echoserver:1.4\". Addon deployment info: %s", deploymentInfo)
+	}
+}
+
+// validateKubernetesImages verifies that a restarted cluster contains all the necessary images
+func validateKubernetesImages(ctx context.Context, t *testing.T, profile, _, tcVersion string, _ []string) {
+	if !NoneDriver() {
+		testPulledImages(ctx, t, profile, tcVersion)
+	}
+}
+
+// validatePauseAfterStart verifies that minikube pause works
+func validatePauseAfterStart(ctx context.Context, t *testing.T, profile, _, _ string, _ []string) {
+	defer PostMortemLogs(t, profile)
+	testPause(ctx, t, profile)
 }
 
 // testPodScheduling asserts that this configuration can schedule new pods
 func testPodScheduling(ctx context.Context, t *testing.T, profile string) {
+	defer PostMortemLogs(t, profile)
+
 	t.Helper()
 
 	// schedule a pod to assert persistence
-	rr, err := Run(t, exec.CommandContext(ctx, "kubectl", "--context", profile, "create", "-f", filepath.Join(*testdataDir, "busybox.yaml")))
+	rr, err := Run(t, exec.CommandContext(ctx, KubectlBinary(), "--context", profile, "create", "-f", filepath.Join(*testdataDir, "busybox.yaml")))
 	if err != nil {
 		t.Fatalf("%s failed: %v", rr.Command(), err)
 	}
@@ -230,7 +329,7 @@ func testPodScheduling(ctx context.Context, t *testing.T, profile string) {
 	}
 
 	// Use this pod to confirm that the runtime resource limits are sane
-	rr, err = Run(t, exec.CommandContext(ctx, "kubectl", "--context", profile, "exec", names[0], "--", "/bin/sh", "-c", "ulimit -n"))
+	rr, err = Run(t, exec.CommandContext(ctx, KubectlBinary(), "--context", profile, "exec", names[0], "--", "/bin/sh", "-c", "ulimit -n"))
 	if err != nil {
 		t.Fatalf("ulimit: %v", err)
 	}
@@ -248,63 +347,90 @@ func testPodScheduling(ctx context.Context, t *testing.T, profile string) {
 }
 
 // testPulledImages asserts that this configuration pulls only expected images
-func testPulledImages(ctx context.Context, t *testing.T, profile string, version string) {
+func testPulledImages(ctx context.Context, t *testing.T, profile, version string) {
 	t.Helper()
+	defer PostMortemLogs(t, profile)
 
-	rr, err := Run(t, exec.CommandContext(ctx, Target(), "ssh", "-p", profile, "sudo crictl images -o json"))
+	// TODO(prezha): once we bump the minimum supported k8s version to v1.24+
+	// (where dockershim is deprecated, while cri-tools we use support cri v1 api),
+	// we can revert back to the "crictl" to check images here - eg:
+	// rr, err := Run(t, exec.CommandContext(ctx, Target(), "ssh", "-p", profile, "sudo crictl images -o json"))
+	rr, err := Run(t, exec.CommandContext(ctx, Target(), "-p", profile, "image", "list", "--format=json"))
 	if err != nil {
-		t.Errorf("failed tp get images inside minikube. args %q: %v", rr.Command(), err)
+		t.Errorf("failed to get images inside minikube. args %q: %v", rr.Command(), err)
 	}
-	jv := map[string][]struct {
+	jv := []struct {
 		Tags []string `json:"repoTags"`
 	}{}
-	err = json.Unmarshal(rr.Stdout.Bytes(), &jv)
-	if err != nil {
-		t.Errorf("failed to decode images json %v. output: %s", err, rr.Output())
+
+	stdout := rr.Stdout.String()
+
+	if err := json.Unmarshal([]byte(stdout), &jv); err != nil {
+		t.Errorf("failed to decode images json %v. output:\n%s", err, stdout)
 	}
+
 	found := map[string]bool{}
-	for _, img := range jv["images"] {
+	for _, img := range jv {
 		for _, i := range img.Tags {
-			// Remove container-specific prefixes for naming consistency
-			i = strings.TrimPrefix(i, "docker.io/")
-			i = strings.TrimPrefix(i, "localhost/")
+			i = trimImageName(i)
 			if defaultImage(i) {
 				found[i] = true
-			} else {
-				t.Logf("Found non-minikube image: %s", i)
+				continue
 			}
+			t.Logf("Found non-minikube image: %s", i)
 		}
 	}
-	want, err := images.Kubeadm("", version)
+
+	mirror := ""
+	// Kubernetes versions prior to v1.25 will contain the old registry due to the preload
+	if v, _ := util.ParseKubernetesVersion(version); v.LT(semver.MustParse("1.25.0-alpha.1")) {
+		mirror = "k8s.gcr.io"
+	}
+	wantRaw, err := images.Kubeadm(mirror, version)
 	if err != nil {
 		t.Errorf("failed to get kubeadm images for %s : %v", version, err)
 	}
+	// we need to trim the want raw, because if runtime is docker it will not report the full name with docker.io as prefix
+	want := []string{}
+	for _, i := range wantRaw {
+		want = append(want, trimImageName(i))
+	}
+
 	gotImages := []string{}
 	for k := range found {
 		gotImages = append(gotImages, k)
 	}
 	sort.Strings(want)
 	sort.Strings(gotImages)
-	if diff := cmp.Diff(want, gotImages); diff != "" {
-		t.Errorf("%s images mismatch (-want +got):\n%s", version, diff)
+	// check if we got all the images we want, ignoring any extraneous ones in cache (eg, may be created by other tests)
+	missing := false
+	for _, img := range want {
+		if sort.SearchStrings(gotImages, img) == len(gotImages) {
+			missing = true
+			break
+		}
+	}
+	if missing {
+		t.Errorf("%s images missing (-want +got):\n%s", version, cmp.Diff(want, gotImages))
 	}
 }
 
 // testPause asserts that this configuration can be paused and unpaused
 func testPause(ctx context.Context, t *testing.T, profile string) {
 	t.Helper()
+	defer PostMortemLogs(t, profile)
 
 	rr, err := Run(t, exec.CommandContext(ctx, Target(), "pause", "-p", profile, "--alsologtostderr", "-v=1"))
 	if err != nil {
 		t.Fatalf("%s failed: %v", rr.Command(), err)
 	}
 
-	got := Status(ctx, t, Target(), profile, "APIServer")
+	got := Status(ctx, t, Target(), profile, "APIServer", profile)
 	if got != state.Paused.String() {
 		t.Errorf("post-pause apiserver status = %q; want = %q", got, state.Paused)
 	}
 
-	got = Status(ctx, t, Target(), profile, "Kubelet")
+	got = Status(ctx, t, Target(), profile, "Kubelet", profile)
 	if got != state.Stopped.String() {
 		t.Errorf("post-pause kubelet status = %q; want = %q", got, state.Stopped)
 	}
@@ -314,16 +440,32 @@ func testPause(ctx context.Context, t *testing.T, profile string) {
 		t.Fatalf("%s failed: %v", rr.Command(), err)
 	}
 
-	got = Status(ctx, t, Target(), profile, "APIServer")
+	got = Status(ctx, t, Target(), profile, "APIServer", profile)
 	if got != state.Running.String() {
 		t.Errorf("post-unpause apiserver status = %q; want = %q", got, state.Running)
 	}
 
-	got = Status(ctx, t, Target(), profile, "Kubelet")
+	got = Status(ctx, t, Target(), profile, "Kubelet", profile)
 	if got != state.Running.String() {
 		t.Errorf("post-unpause kubelet status = %q; want = %q", got, state.Running)
 	}
 
+}
+
+// Remove container-specific prefixes for naming consistency
+// for example in `docker` runtime we get this:
+//
+//		$ docker@minikube:~$ sudo crictl images -o json | grep dash
+//	         "kubernetesui/dashboard:vX.X.X"
+//
+// but for 'containerd' we get full name
+//
+//			$ docker@minikube:~$  sudo crictl images -o json | grep dash
+//	       	 "docker.io/kubernetesui/dashboard:vX.X.X"
+func trimImageName(name string) string {
+	name = strings.TrimPrefix(name, "docker.io/")
+	name = strings.TrimPrefix(name, "localhost/")
+	return name
 }
 
 // defaultImage returns true if this image is expected in a default minikube install
@@ -331,7 +473,7 @@ func defaultImage(name string) bool {
 	if strings.Contains(name, ":latest") {
 		return false
 	}
-	if strings.Contains(name, "k8s.gcr.io") || strings.Contains(name, "kubernetesui") || strings.Contains(name, "storage-provisioner") {
+	if strings.Contains(name, "k8s.gcr.io") || strings.Contains(name, "registry.k8s.io") || strings.Contains(name, "kubernetesui") || strings.Contains(name, "storage-provisioner") {
 		return true
 	}
 	return false

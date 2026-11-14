@@ -17,42 +17,50 @@ limitations under the License.
 package cmd
 
 import (
+	"os"
+
 	"github.com/spf13/cobra"
-	"k8s.io/minikube/pkg/minikube/driver"
+	"k8s.io/minikube/cmd/minikube/cmd/flags"
+	"k8s.io/minikube/pkg/minikube/config"
 	"k8s.io/minikube/pkg/minikube/exit"
 	"k8s.io/minikube/pkg/minikube/machine"
 	"k8s.io/minikube/pkg/minikube/mustload"
 	"k8s.io/minikube/pkg/minikube/node"
 	"k8s.io/minikube/pkg/minikube/out"
+	"k8s.io/minikube/pkg/minikube/reason"
+	"k8s.io/minikube/pkg/minikube/style"
 )
 
 var nodeStopCmd = &cobra.Command{
-	Use:   "stop",
-	Short: "Stops a node in a cluster.",
-	Long:  "Stops a node in a cluster.",
-	Run: func(cmd *cobra.Command, args []string) {
+	Use:     "stop NODE_NAME",
+	Short:   "Stops a node in a cluster.",
+	Long:    "Stops a node in a cluster.",
+	Example: "minikube node stop m02",
+	Run: func(_ *cobra.Command, args []string) {
 		if len(args) == 0 {
-			exit.UsageT("Usage: minikube node stop [name]")
+			exit.Message(reason.Usage, "Usage: minikube node stop NODE_NAME")
 		}
 
+		options := flags.CommandOptions()
 		name := args[0]
-		api, cc := mustload.Partial(ClusterFlagValue())
+		api, cc := mustload.Partial(ClusterFlagValue(), options)
 
-		n, _, err := node.Retrieve(cc, name)
+		n, _, err := node.Retrieve(*cc, name)
 		if err != nil {
-			exit.WithError("retrieving node", err)
+			exit.Message(reason.GuestNodeRetrieve, err.Error())
 		}
 
-		machineName := driver.MachineName(*cc, *n)
+		machineName := config.MachineName(*cc, *n)
 
 		err = machine.StopHost(api, machineName)
 		if err != nil {
-			out.FatalT("Failed to stop node {{.name}}", out.V{"name": name})
+			out.ErrT(style.Fatal, "Failed to stop node {{.name}}: {{.error}}", out.V{"name": name, "error": err})
+			os.Exit(reason.ExHostError)
 		}
+		out.Step(style.Stopped, "Successfully stopped node {{.name}}", out.V{"name": machineName})
 	},
 }
 
 func init() {
-	nodeStopCmd.Flags().String("name", "", "The name of the node to delete")
 	nodeCmd.AddCommand(nodeStopCmd)
 }

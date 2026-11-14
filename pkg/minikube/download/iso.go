@@ -22,15 +22,16 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
-	"github.com/golang/glog"
-	"github.com/hashicorp/go-getter"
-	"github.com/juju/mutex"
-	"github.com/pkg/errors"
-	"k8s.io/minikube/pkg/minikube/localpath"
+	"errors"
+
+	"k8s.io/klog/v2"
+	"k8s.io/minikube/pkg/minikube/detect"
 	"k8s.io/minikube/pkg/minikube/out"
+	"k8s.io/minikube/pkg/minikube/style"
 	"k8s.io/minikube/pkg/util/lock"
 	"k8s.io/minikube/pkg/version"
 )
@@ -40,10 +41,12 @@ const fileScheme = "file"
 // DefaultISOURLs returns a list of ISO URL's to consult by default, in priority order
 func DefaultISOURLs() []string {
 	v := version.GetISOVersion()
+	isoBucket := "minikube-builds/iso/24028"
+
 	return []string{
-		fmt.Sprintf("https://storage.googleapis.com/minikube/iso/minikube-%s.iso", v),
-		fmt.Sprintf("https://github.com/kubernetes/minikube/releases/download/%s/minikube-%s.iso", v, v),
-		fmt.Sprintf("https://kubernetes.oss-cn-hangzhou.aliyuncs.com/minikube/iso/minikube-%s.iso", v),
+		fmt.Sprintf("https://storage.googleapis.com/%s/minikube-%s-%s.iso", isoBucket, v, runtime.GOARCH),
+		fmt.Sprintf("https://github.com/kubernetes/minikube/releases/download/%s/minikube-%s-%s.iso", v, v, runtime.GOARCH),
+		fmt.Sprintf("https://kubernetes.oss-cn-hangzhou.aliyuncs.com/minikube/iso/minikube-%s-%s.iso", v, runtime.GOARCH),
 	}
 }
 
@@ -52,7 +55,7 @@ func LocalISOResource(isoURL string) string {
 	u, err := url.Parse(isoURL)
 	if err != nil {
 		fake := "file://" + filepath.ToSlash(isoURL)
-		glog.Errorf("%s is not a URL! Returning %s", isoURL, fake)
+		klog.Errorf("%s is not a URL! Returning %s", isoURL, fake)
 		return fake
 	}
 
@@ -64,8 +67,8 @@ func LocalISOResource(isoURL string) string {
 }
 
 // fileURI returns a file:// URI for a path
-func fileURI(path string) string {
-	return "file://" + filepath.ToSlash(path)
+func fileURI(filePath string) string {
+	return "file://" + filepath.ToSlash(filePath)
 }
 
 // localISOPath returns where an ISO should be stored locally
@@ -74,37 +77,37 @@ func localISOPath(u *url.URL) string {
 		return u.String()
 	}
 
-	return filepath.Join(localpath.MiniPath(), "cache", "iso", path.Base(u.Path))
+	return filepath.Join(detect.ISOCacheDir(), path.Base(u.Path))
 }
 
 // ISO downloads and returns the path to the downloaded ISO
 func ISO(urls []string, skipChecksum bool) (string, error) {
 	errs := map[string]string{}
 
-	for _, url := range urls {
-		err := downloadISO(url, skipChecksum)
+	for _, u := range urls {
+		err := downloadISO(u, skipChecksum)
 		if err != nil {
-			glog.Errorf("Unable to download %s: %v", url, err)
-			errs[url] = err.Error()
+			klog.Errorf("Unable to download %s: %v", u, err)
+			errs[u] = err.Error()
 			continue
 		}
-		return url, nil
+		return u, nil
 	}
 
 	var msg strings.Builder
 	msg.WriteString("unable to cache ISO: \n")
 	for u, err := range errs {
-		msg.WriteString(fmt.Sprintf("  %s: %s\n", u, err))
+		fmt.Fprintf(&msg, "  %s: %s\n", u, err)
 	}
 
-	return "", fmt.Errorf(msg.String())
+	return "", errors.New(msg.String())
 }
 
 // downloadISO downloads an ISO URL
 func downloadISO(isoURL string, skipChecksum bool) error {
 	u, err := url.Parse(isoURL)
 	if err != nil {
-		return errors.Wrapf(err, "url.parse %q", isoURL)
+		return fmt.Errorf("url.parse %q: %w", isoURL, err)
 	}
 
 	// It's already downloaded
@@ -114,12 +117,15 @@ func downloadISO(isoURL string, skipChecksum bool) error {
 
 	// Lock before we check for existence to avoid thundering herd issues
 	dst := localISOPath(u)
+	if err := os.MkdirAll(filepath.Dir(dst), 0777); err != nil {
+		return fmt.Errorf("making cache image directory: %s: %w", dst, err)
+	}
 	spec := lock.PathMutexSpec(dst)
 	spec.Timeout = 10 * time.Minute
-	glog.Infof("acquiring lock: %+v", spec)
-	releaser, err := mutex.Acquire(spec)
+	klog.Infof("acquiring lock: %+v", spec)
+	releaser, err := lock.Acquire(spec)
 	if err != nil {
-		return errors.Wrapf(err, "unable to acquire lock for %+v", spec)
+		return fmt.Errorf("unable to acquire lock for %+v: %w", spec, err)
 	}
 	defer releaser.Release()
 
@@ -127,26 +133,12 @@ func downloadISO(isoURL string, skipChecksum bool) error {
 		return nil
 	}
 
-	out.T(out.ISODownload, "Downloading VM boot image ...")
+	out.Step(style.ISODownload, "Downloading VM boot image ...")
 
 	urlWithChecksum := isoURL + "?checksum=file:" + isoURL + ".sha256"
 	if skipChecksum {
 		urlWithChecksum = isoURL
 	}
 
-	tmpDst := dst + ".download"
-
-	opts := []getter.ClientOption{getter.WithProgress(DefaultProgressBar)}
-	client := &getter.Client{
-		Src:     urlWithChecksum,
-		Dst:     tmpDst,
-		Mode:    getter.ClientModeFile,
-		Options: opts,
-	}
-
-	glog.Infof("full url: %s", urlWithChecksum)
-	if err := client.Get(); err != nil {
-		return errors.Wrap(err, isoURL)
-	}
-	return os.Rename(tmpDst, dst)
+	return download(urlWithChecksum, dst)
 }

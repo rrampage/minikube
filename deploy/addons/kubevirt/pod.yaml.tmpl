@@ -1,0 +1,95 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  namespace: kube-system
+  name: kubevirt-scripts
+  labels:
+    kubernetes.io/minikube-addons: kubevirt
+    addonmanager.kubernetes.io/mode: Reconcile
+data:
+  uninstall.sh: |
+    #!/bin/bash
+    export KUBEVIRT_VERSION="v1.9.1"
+
+    kubectl delete kubevirt kubevirt -n kubevirt
+
+    kubectl delete -f "https://github.com/kubevirt/kubevirt/releases/download/${KUBEVIRT_VERSION}/kubevirt-operator.yaml"
+  install.sh: |
+    #!/bin/bash
+
+    # To update: check https://storage.googleapis.com/kubevirt-prow/release/kubevirt/kubevirt/stable.txt
+    export KUBEVIRT_VERSION="v1.9.1"
+    echo "Installing KubeVirt version: $KUBEVIRT_VERSION"
+
+    kubectl create -f "https://github.com/kubevirt/kubevirt/releases/download/${KUBEVIRT_VERSION}/kubevirt-operator.yaml"
+
+    HARDWARE_EMULATION=$(grep -E 'svm|vmx' /proc/cpuinfo)
+    if [ -z "$HARDWARE_EMULATION" ]; then
+      echo "Using software emulation"
+
+      echo "
+    apiVersion: kubevirt.io/v1
+    kind: KubeVirt
+    metadata:
+      name: kubevirt
+      namespace: kubevirt
+    spec:
+      configuration:
+        developerConfiguration:
+          useEmulation: true
+    " | kubectl apply -f -
+
+    else
+
+      echo "
+    apiVersion: kubevirt.io/v1
+    kind: KubeVirt
+    metadata:
+      name: kubevirt
+      namespace: kubevirt
+    spec: {}
+    " | kubectl apply -f -
+
+    fi
+
+    sleep infinity
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  labels:
+    kubernetes.io/minikube-addons: kubevirt
+    addonmanager.kubernetes.io/mode: Reconcile
+  name: kubevirt-install-manager
+  namespace: kube-system
+spec:
+  containers:
+  - command:
+    - /bin/bash
+    - -c
+    - /kubevirt-scripts/install.sh
+    image: {{.CustomRegistries.Kubectl  | default .ImageRepository | default .Registries.Kubectl }}{{.Images.Kubectl}}
+    imagePullPolicy: IfNotPresent
+    name: kubevirt-provisioner
+    lifecycle:
+      preStop:
+        exec:
+          command:
+          - /bin/bash
+          - -c
+          - /kubevirt-scripts/uninstall.sh
+    terminationMessagePath: /dev/termination-log
+    terminationMessagePolicy: File
+    volumeMounts:
+    - mountPath: /manifests
+      name: tmp
+    - mountPath: /kubevirt-scripts
+      name: kubevirt-scripts
+  terminationGracePeriodSeconds: 60
+  volumes:
+  - name: tmp
+    emptyDir: {}
+  - name: kubevirt-scripts
+    configMap:
+      defaultMode: 0777
+      name: kubevirt-scripts

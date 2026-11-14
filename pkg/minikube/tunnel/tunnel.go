@@ -20,16 +20,10 @@ import (
 	"fmt"
 	"os"
 
-	"os/exec"
-	"regexp"
-
-	"github.com/docker/machine/libmachine"
-	"github.com/docker/machine/libmachine/host"
-	"github.com/golang/glog"
-	"github.com/pkg/errors"
 	typed_core "k8s.io/client-go/kubernetes/typed/core/v1"
+	"k8s.io/klog/v2"
+	"k8s.io/minikube/pkg/libmachine"
 	"k8s.io/minikube/pkg/minikube/config"
-	"k8s.io/minikube/pkg/minikube/driver"
 )
 
 // tunnel represents the basic API for a tunnel: periodically the state of the tunnel
@@ -96,15 +90,15 @@ type tunnel struct {
 }
 
 func (t *tunnel) cleanup() *Status {
-	glog.V(3).Infof("cleaning up %s", t.status.TunnelID.Route)
+	klog.V(3).Infof("cleaning up %s", t.status.TunnelID.Route)
 	err := t.router.Cleanup(t.status.TunnelID.Route)
 	if err != nil {
-		t.status.RouteError = errors.Errorf("error cleaning up route: %v", err)
-		glog.V(3).Infof(t.status.RouteError.Error())
+		t.status.RouteError = fmt.Errorf("error cleaning up route: %v", err)
+		klog.V(3).Info(t.status.RouteError.Error())
 	} else {
 		err = t.registry.Remove(t.status.TunnelID.Route)
 		if err != nil {
-			glog.V(3).Infof("error removing route from registry: %v", err)
+			klog.V(3).Infof("error removing route from registry: %v", err)
 		}
 	}
 	if t.status.MinikubeState == Running {
@@ -114,23 +108,22 @@ func (t *tunnel) cleanup() *Status {
 }
 
 func (t *tunnel) update() *Status {
-	glog.V(3).Info("updating tunnel status...")
-	var h *host.Host
-	t.status.MinikubeState, h, t.status.MinikubeError = t.clusterInspector.getStateAndHost()
+	klog.V(3).Info("updating tunnel status...")
+	t.status.MinikubeState, _, t.status.MinikubeError = t.clusterInspector.getStateAndHost()
 	defer t.clusterInspector.machineAPI.Close()
 	if t.status.MinikubeState == Running {
-		glog.V(3).Infof("minikube is running, trying to add route%s", t.status.TunnelID.Route)
-		setupRoute(t, h)
+		klog.V(3).Infof("minikube is running, trying to add route%s", t.status.TunnelID.Route)
+		setupRoute(t)
 		if t.status.RouteError == nil {
 			t.status.PatchedServices, t.status.LoadBalancerEmulatorError = t.LoadBalancerEmulator.PatchServices()
 		}
 	}
-	glog.V(3).Infof("sending report %s", t.status)
+	klog.V(3).Infof("sending report %s", t.status)
 	t.reporter.Report(t.status.Clone())
 	return t.status
 }
 
-func setupRoute(t *tunnel, h *host.Host) {
+func setupRoute(t *tunnel) {
 	exists, conflict, _, err := t.router.Inspect(t.status.TunnelID.Route)
 	if err != nil {
 		t.status.RouteError = fmt.Errorf("error checking for route state: %s", err)
@@ -145,18 +138,11 @@ func setupRoute(t *tunnel, h *host.Host) {
 		// the route was added successfully, we need to make sure the registry has it too
 		// this might fail in race conditions, when another process created this tunnel
 		if err := t.registry.Register(&t.status.TunnelID); err != nil {
-			glog.Errorf("failed to register tunnel: %s", err)
+			klog.Errorf("failed to register tunnel: %s", err)
 			t.status.RouteError = err
 			return
 		}
 
-		if h.DriverName == driver.HyperKit {
-			// the virtio-net interface acts up with ip tunnels :(
-			setupBridge(t)
-			if t.status.RouteError != nil {
-				return
-			}
-		}
 	}
 
 	// error scenarios
@@ -169,7 +155,7 @@ func setupRoute(t *tunnel, h *host.Host) {
 	// the route exists, make sure that this process owns it in the registry
 	existingTunnel, err := t.registry.IsAlreadyDefinedAndRunning(&t.status.TunnelID)
 	if err != nil {
-		glog.Errorf("failed to check for other tunnels: %s", err)
+		klog.Errorf("failed to check for other tunnels: %s", err)
 		t.status.RouteError = err
 		return
 	}
@@ -177,7 +163,7 @@ func setupRoute(t *tunnel, h *host.Host) {
 	if existingTunnel == nil {
 		// the route exists, but "orphaned", this process will "own it" in the registry
 		if err := t.registry.Register(&t.status.TunnelID); err != nil {
-			glog.Errorf("failed to register tunnel: %s", err)
+			klog.Errorf("failed to register tunnel: %s", err)
 			t.status.RouteError = err
 		}
 		return
@@ -189,40 +175,4 @@ func setupRoute(t *tunnel, h *host.Host) {
 		return
 	}
 
-}
-
-func setupBridge(t *tunnel) {
-	command := exec.Command("ifconfig", "bridge100")
-	glog.Infof("About to run command: %s\n", command.Args)
-	response, err := command.CombinedOutput()
-	if err != nil {
-		t.status.RouteError = fmt.Errorf("running %v: %v", command.Args, err)
-		return
-	}
-	iface := string(response)
-	pattern := regexp.MustCompile(`.*member: (en\d+) flags=.*`)
-	submatch := pattern.FindStringSubmatch(iface)
-	if len(submatch) != 2 {
-		t.status.RouteError = fmt.Errorf("couldn't find member in bridge100 interface: %s", iface)
-		return
-	}
-
-	member := submatch[1]
-	command = exec.Command("sudo", "ifconfig", "bridge100", "deletem", member)
-	glog.Infof("About to run command: %s\n", command.Args)
-	response, err = command.CombinedOutput()
-	glog.Infof(string(response))
-	if err != nil {
-		t.status.RouteError = fmt.Errorf("couldn't remove member %s: %s", member, err)
-		return
-	}
-
-	command = exec.Command("sudo", "ifconfig", "bridge100", "addm", member)
-	glog.Infof("About to run command: %s\n", command.Args)
-	response, err = command.CombinedOutput()
-	glog.Infof(string(response))
-	if err != nil {
-		t.status.RouteError = fmt.Errorf("couldn't re-add member %s: %s", member, err)
-		return
-	}
 }

@@ -22,14 +22,14 @@ import (
 	"text/template"
 	"time"
 
-	"github.com/docker/machine/libmachine/auth"
-	"github.com/docker/machine/libmachine/drivers"
-	"github.com/docker/machine/libmachine/engine"
-	"github.com/docker/machine/libmachine/provision"
-	"github.com/docker/machine/libmachine/provision/pkgaction"
-	"github.com/docker/machine/libmachine/swarm"
-	"github.com/golang/glog"
 	"github.com/spf13/viper"
+	"k8s.io/klog/v2"
+	"k8s.io/minikube/pkg/libmachine/auth"
+	"k8s.io/minikube/pkg/libmachine/drivers"
+	"k8s.io/minikube/pkg/libmachine/engine"
+	"k8s.io/minikube/pkg/libmachine/provision"
+	"k8s.io/minikube/pkg/libmachine/provision/pkgaction"
+	"k8s.io/minikube/pkg/libmachine/swarm"
 	"k8s.io/minikube/pkg/minikube/config"
 	"k8s.io/minikube/pkg/util/retry"
 )
@@ -68,23 +68,31 @@ func (p *UbuntuProvisioner) GenerateDockerOptions(dockerPort int) (*provision.Do
 	noPivot := true
 	// Using pivot_root is not supported on fstype rootfs
 	if fstype, err := rootFileSystemType(p); err == nil {
-		glog.Infof("root file system type: %s", fstype)
+		klog.Infof("root file system type: %s", fstype)
 		noPivot = fstype == "rootfs"
 	}
+	/* Template is copied from https://github.com/moby/moby/blob/44bca1adf3c806c4ed6688d67c6f995653b09b26/contrib/init/systemd/docker.service#L2 with the following changes:
+	   ExecStart: additional flags are added
 
+	   StartLimitBurst=3 : The service can be restarted up to 3 times within the time window defined by StartLimitIntervalSec.
+
+	   StartLimitIntervalSec=60 : The time window is 60 seconds. If the service fails and restarts more than 3 times in 60 seconds, systemd will stop trying to restart it automatically.
+	*/
 	engineConfigTmpl := `[Unit]
 Description=Docker Application Container Engine
 Documentation=https://docs.docker.com
-BindsTo=containerd.service
-After=network-online.target firewalld.service containerd.service
-Wants=network-online.target
+After=network-online.target nss-lookup.target docker.socket firewalld.service containerd.service time-set.target
+Wants=network-online.target containerd.service
 Requires=docker.socket
+StartLimitBurst=3
+StartLimitIntervalSec=60
 
 [Service]
 Type=notify
+Restart=always
 `
 	if noPivot {
-		glog.Warning("Using fundamentally insecure --no-pivot option")
+		klog.Warning("Using fundamentally insecure --no-pivot option")
 		engineConfigTmpl += `
 # DOCKER_RAMDISK disables pivot_root in Docker, using MS_MOVE instead.
 Environment=DOCKER_RAMDISK=yes
@@ -105,8 +113,15 @@ Environment=DOCKER_RAMDISK=yes
 # NOTE: default-ulimit=nofile is set to an arbitrary number for consistency with other
 # container runtimes. If left unlimited, it may result in OOM issues with MySQL.
 ExecStart=
-ExecStart=/usr/bin/dockerd -H tcp://0.0.0.0:2376 -H unix:///var/run/docker.sock --default-ulimit=nofile=1048576:1048576 --tlsverify --tlscacert {{.AuthOptions.CaCertRemotePath}} --tlscert {{.AuthOptions.ServerCertRemotePath}} --tlskey {{.AuthOptions.ServerKeyRemotePath}} {{ range .EngineOptions.Labels }}--label {{.}} {{ end }}{{ range .EngineOptions.InsecureRegistry }}--insecure-registry {{.}} {{ end }}{{ range .EngineOptions.RegistryMirror }}--registry-mirror {{.}} {{ end }}{{ range .EngineOptions.ArbitraryFlags }}--{{.}} {{ end }}
-ExecReload=/bin/kill -s HUP $MAINPID
+ExecStart=/usr/bin/dockerd -H tcp://0.0.0.0:2376 \
+	-H fd:// --containerd=/run/containerd/containerd.sock \
+	-H unix:///var/run/docker.sock \
+	--default-ulimit=nofile=1048576:1048576 \
+	--tlsverify \
+	--tlscacert {{.AuthOptions.CaCertRemotePath}} \
+	--tlscert {{.AuthOptions.ServerCertRemotePath}} \
+	--tlskey {{.AuthOptions.ServerKeyRemotePath}} {{ range .EngineOptions.Labels }}--label {{.}} {{ end }}{{ range .EngineOptions.InsecureRegistry }}--insecure-registry {{.}} {{ end }}{{ range .EngineOptions.RegistryMirror }}--registry-mirror {{.}} {{ end }}{{ range .EngineOptions.ArbitraryFlags }}--{{.}} {{ end }}
+ExecReload=/bin/kill -s HUP \$MAINPID
 
 # Having non-zero Limit*s causes performance problems due to accounting overhead
 # in the kernel. We recommend using cgroups to do container-local accounting.
@@ -124,6 +139,7 @@ Delegate=yes
 
 # kill only the docker process, not all processes in the cgroup
 KillMode=process
+OOMScoreAdjust=-500
 
 [Install]
 WantedBy=multi-user.target
@@ -153,7 +169,7 @@ WantedBy=multi-user.target
 }
 
 // Package installs a package
-func (p *UbuntuProvisioner) Package(name string, action pkgaction.PackageAction) error {
+func (p *UbuntuProvisioner) Package(_ string, _ pkgaction.PackageAction) error {
 	return nil
 }
 
@@ -163,33 +179,33 @@ func (p *UbuntuProvisioner) Provision(swarmOptions swarm.Options, authOptions au
 	p.AuthOptions = authOptions
 	p.EngineOptions = engineOptions
 
-	glog.Infof("provisioning hostname %q", p.Driver.GetMachineName())
+	klog.Infof("provisioning hostname %q", p.Driver.GetMachineName())
 	if err := p.SetHostname(p.Driver.GetMachineName()); err != nil {
 		return err
 	}
 
 	p.AuthOptions = setRemoteAuthOptions(p)
-	glog.Infof("set auth options %+v", p.AuthOptions)
+	klog.Infof("set auth options %+v", p.AuthOptions)
 
-	glog.Infof("setting up certificates")
+	klog.Infof("setting up certificates")
 	configAuth := func() error {
 		if err := configureAuth(p); err != nil {
-			glog.Warningf("configureAuth failed: %v", err)
+			klog.Warningf("configureAuth failed: %v", err)
 			return &retry.RetriableError{Err: err}
 		}
 		return nil
 	}
 
-	err := retry.Expo(configAuth, time.Second, 2*time.Minute)
+	err := retry.Expo(configAuth, 100*time.Microsecond, 2*time.Minute)
 
 	if err != nil {
-		glog.Infof("Error configuring auth during provisioning %v", err)
+		klog.Infof("Error configuring auth during provisioning %v", err)
 		return err
 	}
 
-	glog.Infof("setting minikube options for container-runtime")
+	klog.Infof("setting minikube options for container-runtime")
 	if err := setContainerRuntimeOptions(p.clusterName, p); err != nil {
-		glog.Infof("Error setting container-runtime options during provisioning %v", err)
+		klog.Infof("Error setting container-runtime options during provisioning %v", err)
 		return err
 	}
 

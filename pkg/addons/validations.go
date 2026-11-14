@@ -17,11 +17,21 @@ limitations under the License.
 package addons
 
 import (
+	"errors"
 	"fmt"
+	"slices"
+	"strconv"
 
+	"github.com/spf13/viper"
+	"k8s.io/minikube/pkg/minikube/assets"
 	"k8s.io/minikube/pkg/minikube/config"
 	"k8s.io/minikube/pkg/minikube/cruntime"
+	"k8s.io/minikube/pkg/minikube/driver"
+	"k8s.io/minikube/pkg/minikube/out"
+	"k8s.io/minikube/pkg/minikube/run"
 )
+
+const volumesnapshotsAddon = "volumesnapshots"
 
 // containerdOnlyMsg is the message shown when a containerd-only addon is enabled
 const containerdOnlyAddonMsg = `
@@ -33,17 +43,47 @@ and then start minikube again with the following flags:
 
 minikube start --container-runtime=containerd --docker-opt containerd=/var/run/containerd/containerd.sock`
 
-// IsRuntimeContainerd is a validator which returns an error if the current runtime is not containerd
-func IsRuntimeContainerd(cc *config.ClusterConfig, _, _ string) error {
+// volumesnapshotsDisabledMsg is the message shown when csi-hostpath-driver addon is enabled without the volumesnapshots addon
+const volumesnapshotsDisabledMsg = `[WARNING] For full functionality, the 'csi-hostpath-driver' addon requires the 'volumesnapshots' addon to be enabled.
+
+You can enable 'volumesnapshots' addon by running: 'minikube addons enable volumesnapshots'
+`
+
+func isRuntimeContainerd(cc *config.ClusterConfig, _, _ string, _ *run.CommandOptions) error {
 	r, err := cruntime.New(cruntime.Config{Type: cc.KubernetesConfig.ContainerRuntime})
 	if err != nil {
 		return err
 	}
 	_, ok := r.(*cruntime.Containerd)
 	if !ok {
-		return fmt.Errorf(containerdOnlyAddonMsg)
+		return errors.New(containerdOnlyAddonMsg)
 	}
 	return nil
+}
+
+// isVolumesnapshotsEnabled is a validator that prints out a warning if the volumesnapshots addon
+// is disabled (does not return any errors!)
+func isVolumesnapshotsEnabled(cc *config.ClusterConfig, _, value string, _ *run.CommandOptions) error {
+	isCsiDriverEnabled, _ := strconv.ParseBool(value)
+	// assets.Addons[].IsEnabled() returns the current status of the addon or default value.
+	// config.AddonList contains list of addons to be enabled.
+	addonList := viper.GetStringSlice(config.AddonListFlag)
+	isVolumesnapshotsEnabled := assets.Addons[volumesnapshotsAddon].IsEnabled(cc) || slices.Contains(addonList, volumesnapshotsAddon)
+	if isCsiDriverEnabled && !isVolumesnapshotsEnabled {
+		// just print out a warning directly, we don't want to return any errors since
+		// that would prevent the addon from being enabled (callbacks wouldn't be run)
+		out.WarningT(volumesnapshotsDisabledMsg)
+	}
+	return nil
+}
+
+func isKVMDriverForNVIDIA(cc *config.ClusterConfig, name, _ string, _ *run.CommandOptions) error {
+	if driver.IsKVM(cc.Driver) {
+		return nil
+	}
+	out.Ln("")
+	out.FailureT("The {{.addon}} addon is only supported with the KVM driver.\n\nFor GPU setup instructions see: https://minikube.sigs.k8s.io/docs/tutorials/nvidia/", out.V{"addon": name})
+	return fmt.Errorf("%s addon is only supported with the KVM driver", name)
 }
 
 // isAddonValid returns the addon, true if it is valid

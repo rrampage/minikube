@@ -19,6 +19,8 @@ package config
 import (
 	"path/filepath"
 	"testing"
+
+	"github.com/spf13/viper"
 )
 
 // TestListProfiles uses a different MINIKUBE_HOME with rest of tests since it relies on file list index
@@ -33,7 +35,7 @@ func TestListProfiles(t *testing.T) {
 		expectName string
 		vmDriver   string
 	}{
-		{0, "p1", "hyperkit"},
+		{0, "p1", "vfkit"},
 		{1, "p2_newformat", "virtualbox"},
 	}
 
@@ -48,7 +50,15 @@ func TestListProfiles(t *testing.T) {
 		{2, "p5_partial_config", ""},
 	}
 
+	DockerContainers = func() ([]string, error) {
+		return []string{}, nil
+	}
 	val, inv, err := ListProfiles(miniDir)
+
+	num := len(testCasesValidProfs) + len(testCasesInValidProfs)
+	if num != len(val)+len(inv) {
+		t.Errorf("ListProfiles length = %d, expected %d\nvalid: %v\ninvalid: %v\n", len(val)+len(inv), num, val, inv)
+	}
 
 	for _, tt := range testCasesValidProfs {
 		if val[tt.index].Name != tt.expectName {
@@ -69,6 +79,41 @@ func TestListProfiles(t *testing.T) {
 
 	if err != nil {
 		t.Errorf("error listing profiles %v", err)
+	}
+}
+
+func TestProfileNameValid(t *testing.T) {
+	var testCases = map[string]bool{
+		"profile":             true,
+		"pro-file":            true,
+		"profile1":            true,
+		"pro-file1":           true,
+		"1st-profile":         true,
+		"1st-2nd-3rd-profile": true,
+		"12567":               true,
+		"111":                 true,
+
+		"1":                false,
+		"n":                false,
+		"pro file":         false,
+		"pro-file-":        false,
+		"-profile":         false,
+		"meaningful_name":  false,
+		"meaningful_name@": false,
+		"n_a_m_e_2":        false,
+		"_name":            false,
+		"N__a.M--E12567":   false,
+	}
+
+	for name, exp := range testCases {
+
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			got := ProfileNameValid(name)
+			if got != exp {
+				t.Errorf("expected ProfileNameValid(%s)=%t but got %t ", name, exp, got)
+			}
+		})
 	}
 }
 
@@ -99,7 +144,7 @@ func TestProfileNameInReservedKeywords(t *testing.T) {
 }
 
 func TestProfileExists(t *testing.T) {
-	miniDir, err := filepath.Abs("./testdata/.minikube2")
+	miniDir, err := filepath.Abs("./testdata/.minikube")
 	if err != nil {
 		t.Errorf("error getting dir path for ./testdata/.minikube : %v", err)
 	}
@@ -126,7 +171,7 @@ func TestProfileExists(t *testing.T) {
 }
 
 func TestCreateEmptyProfile(t *testing.T) {
-	miniDir, err := filepath.Abs("./testdata/.minikube2")
+	miniDir, err := filepath.Abs("./testdata/.minikube")
 	if err != nil {
 		t.Errorf("error getting dir path for ./testdata/.minikube : %v", err)
 	}
@@ -157,7 +202,7 @@ func TestCreateEmptyProfile(t *testing.T) {
 }
 
 func TestCreateProfile(t *testing.T) {
-	miniDir, err := filepath.Abs("./testdata/.minikube2")
+	miniDir, err := filepath.Abs("./testdata/.minikube")
 	if err != nil {
 		t.Errorf("error getting dir path for ./testdata/.minikube : %v", err)
 	}
@@ -193,7 +238,7 @@ func TestCreateProfile(t *testing.T) {
 }
 
 func TestDeleteProfile(t *testing.T) {
-	miniDir, err := filepath.Abs("./testdata/.minikube2")
+	miniDir, err := filepath.Abs("./testdata/.minikube")
 	if err != nil {
 		t.Errorf("error getting dir path for ./testdata/.minikube : %v", err)
 	}
@@ -220,7 +265,7 @@ func TestDeleteProfile(t *testing.T) {
 }
 
 func TestGetPrimaryControlPlane(t *testing.T) {
-	miniDir, err := filepath.Abs("./testdata/.minikube2")
+	miniDir, err := filepath.Abs("./testdata/.minikube")
 	if err != nil {
 		t.Errorf("error getting dir path for ./testdata/.minikube : %v", err)
 	}
@@ -232,33 +277,34 @@ func TestGetPrimaryControlPlane(t *testing.T) {
 		expectedPort int
 		expectedName string
 	}{
-		{"old style", "p1", "192.168.64.75", 8443, "minikube"},
-		{"new style", "p2_newformat", "192.168.99.136", 8443, "m01"},
+		{"new style", "p2_newformat", "192.168.59.136", 8443, "m01"},
 	}
 
 	for _, tc := range tests {
-		cc, err := DefaultLoader.LoadConfigFromFile(tc.profile, miniDir)
-		if err != nil {
-			t.Fatalf("Failed to load config for %s", tc.description)
-		}
+		t.Run(tc.description, func(t *testing.T) {
+			cc, err := DefaultLoader.LoadConfigFromFile(tc.profile, miniDir)
+			if err != nil {
+				t.Fatalf("Failed to load config for %s", tc.description)
+			}
 
-		n, err := PrimaryControlPlane(cc)
-		if err != nil {
-			t.Fatalf("Unexpexted error getting primary control plane: %v", err)
-		}
+			// get control-plane node
+			viper.Set(ProfileName, tc.profile)
+			n, err := ControlPlane(*cc)
+			if err != nil {
+				t.Fatalf("Unexpected error getting primary control plane: %v", err)
+			}
 
-		if n.Name != tc.expectedName {
-			t.Errorf("Unexpected name. expected: %s, got: %s", tc.expectedName, n.Name)
-		}
+			if n.Name != tc.expectedName {
+				t.Errorf("Unexpected name. expected: %s, got: %s", tc.expectedName, n.Name)
+			}
 
-		if n.IP != tc.expectedIP {
-			t.Errorf("Unexpected name. expected: %s, got: %s", tc.expectedIP, n.IP)
-		}
+			if n.IP != tc.expectedIP {
+				t.Errorf("Unexpected name. expected: %s, got: %s", tc.expectedIP, n.IP)
+			}
 
-		if n.Port != tc.expectedPort {
-			t.Errorf("Unexpected name. expected: %d, got: %d", tc.expectedPort, n.Port)
-		}
-
+			if n.Port != tc.expectedPort {
+				t.Errorf("Unexpected name. expected: %d, got: %d", tc.expectedPort, n.Port)
+			}
+		})
 	}
-
 }

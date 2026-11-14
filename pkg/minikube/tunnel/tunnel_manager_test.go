@@ -23,8 +23,9 @@ import (
 	"os"
 	"time"
 
-	"github.com/golang/glog"
-	"github.com/pkg/errors"
+	"errors"
+
+	"k8s.io/klog/v2"
 )
 
 func TestTunnelManagerEventHandling(t *testing.T) {
@@ -37,18 +38,18 @@ func TestTunnelManagerEventHandling(t *testing.T) {
 		{
 			name:   "tunnel quits on stopped minikube",
 			repeat: 1,
-			test: func(tunnel *tunnelStub, cancel context.CancelFunc, ready, check, done chan bool) error {
+			test: func(tunnel *tunnelStub, _ context.CancelFunc, ready, check, done chan bool) error {
 				tunnel.mockClusterInfo = &Status{
 					MinikubeState: Stopped,
 				}
-				glog.Info("waiting for tunnel to be ready.")
+				klog.Info("waiting for tunnel to be ready.")
 				<-ready
-				glog.Info("check!")
+				klog.Info("check!")
 				check <- true
-				glog.Info("check done.")
+				klog.Info("check done.")
 				select {
 				case <-done:
-					glog.Info("it's done, yay!")
+					klog.Info("it's done, yay!")
 				case <-time.After(1 * time.Second):
 					t.Error("tunnel did not stop on stopped minikube")
 				}
@@ -62,7 +63,7 @@ func TestTunnelManagerEventHandling(t *testing.T) {
 		{
 			name:   "tunnel quits on ctrlc before doing a check",
 			repeat: 1,
-			test: func(tunnel *tunnelStub, cancel context.CancelFunc, ready, check, done chan bool) error {
+			test: func(tunnel *tunnelStub, cancel context.CancelFunc, ready, _, done chan bool) error {
 				tunnel.mockClusterInfo = &Status{
 					MinikubeState: Stopped,
 				}
@@ -136,7 +137,7 @@ func TestTunnelManagerEventHandling(t *testing.T) {
 				go tunnelManager.run(ctx, tunnel, ready, check, done)
 				err = tc.test(tunnel, cancel, ready, check, done)
 				if err != nil {
-					glog.Errorf("error at %d", i)
+					t.Errorf("error at %d", i)
 				}
 			}
 		})

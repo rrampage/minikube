@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-apiVersion: v1
-kind: ReplicationController
+apiVersion: apps/v1
+kind: Deployment
 metadata:
   name: fluentd-es
   namespace: kube-system
@@ -23,15 +23,21 @@ metadata:
     addonmanager.kubernetes.io/mode: Reconcile
 spec:
   replicas: 1
+  selector:
+    matchLabels:
+      k8s-app: fluentd-es
+      kubernetes.io/minikube-addons: efk
+      addonmanager.kubernetes.io/mode: Reconcile
   template:
     metadata:
       labels:
         k8s-app: fluentd-es
+        kubernetes.io/minikube-addons: efk
         addonmanager.kubernetes.io/mode: Reconcile
     spec:
       containers:
       - name: fluentd-es
-        image: {{default "k8s.gcr.io" .ImageRepository}}/fluentd-elasticsearch:v2.0.2
+        image: {{.CustomRegistries.FluentdElasticsearch  | default .ImageRepository | default .Registries.FluentdElasticsearch }}{{.Images.FluentdElasticsearch}}
         env:
         - name: FLUENTD_ARGS
           value: --no-supervisor -q

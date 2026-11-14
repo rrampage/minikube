@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 
 # Copyright 2019 The Kubernetes Authors All rights reserved.
 #
@@ -27,28 +27,41 @@ set -ex -o pipefail
 readonly PROFILE_NAME="k8sconformance"
 readonly MINIKUBE=${1:-./out/minikube}
 shift || true
-readonly START_ARGS=$*
+readonly START_ARGS=${@:-}
 
 # Requires a fully running Kubernetes cluster.
 "${MINIKUBE}" delete -p "${PROFILE_NAME}" || true
-"${MINIKUBE}" start -p "${PROFILE_NAME}" $START_ARGS
+"${MINIKUBE}" start -p "${PROFILE_NAME}" ${START_ARGS} --wait=all --nodes=2
+kubectl --context "${PROFILE_NAME}" get pods --all-namespaces
 "${MINIKUBE}" status -p "${PROFILE_NAME}"
-kubectl get pods --all-namespaces
 
-go get -u -v github.com/heptio/sonobuoy
-sonobuoy run --wait
+# Make sure jq is installed
+sudo apt-get install jq -y
+
+# Remove old sonobuoy installation
+rm -rf sonobuoy
+
+# Get latest sonobuoy version
+sonobuoy=$(curl -s https://api.github.com/repos/vmware-tanzu/sonobuoy/releases/latest | jq .assets[].browser_download_url | grep linux_amd64 | cut -d '"' -f 2)
+curl -LO $sonobuoy
+tarball=$(echo $sonobuoy | awk -F "/" '{print $(NF)}')
+tar -xzf $tarball
+
+./sonobuoy run --plugin-env=e2e.E2E_EXTRA_ARGS="--ginkgo.v" --mode=certified-conformance --wait --alsologtostderr
 outdir="$(mktemp -d)"
-sonobuoy retrieve "${outdir}"
+./sonobuoy retrieve "${outdir}"
+
+"${MINIKUBE}" delete -p "${PROFILE_NAME}"
 
 cwd=$(pwd)
 
 cd "${outdir}"
 mkdir ./results; tar xzf *.tar.gz -C ./results
 
-version=$(${MINIKUBE} version  | cut -d" " -f3)
+version=$(${cwd}/${MINIKUBE} version  | cut -d" " -f3)
 
-mkdir minikube-${version}
-cd minikube-${version}
+mkdir -p "minikube-${version}"
+cd "minikube-${version}"
 
 cat <<EOF >PRODUCT.yaml
 vendor: minikube
@@ -60,12 +73,36 @@ documentation_url: https://minikube.sigs.k8s.io/docs/
 product_logo_url: https://raw.githubusercontent.com/kubernetes/minikube/master/images/logo/logo.svg
 type: installer
 description: minikube runs a local Kubernetes cluster on macOS, Linux, and Windows.
+contact_email_address: minikube-dev@googlegroups.com
 EOF
 
-cat <<EOF >README.md
-./hack/conformance_tests.sh $MINIKUBE $START_ARGS
+cat <<"EOF" >README.md
+# Reproducing the test results
+
+## Run minikube with docker driver
+
+Install [docker](https://docs.docker.com/engine/install/)
+Install [kubectl](https://v1-18.docs.kubernetes.io/docs/tasks/tools/install-kubectl/)
+Clone the [minikube repo](https://github.com/kubernetes/minikube)
+
+## Compile the latest minikube binary
+```console
+% cd <minikube dir>
+% make
+```
+
+## Trigger the tests and get back the results
+
+We follow the [official instructions](https://github.com/cncf/k8s-conformance/blob/master/instructions.md):
+
+```console
+% cd <minikube dir>
+./hack/conformance_tests.sh ${MINIKUBE} ${START_ARGS}
+```
+
+This script will run sonobuoy against a minikube cluster with two nodes and the provided parameters.
 EOF
 
-cp ../results/plugins/e2e/results/* .
+cp -r ../results/plugins/e2e/results/global/* .
 cd ..
-cp -r minikube-${version} ${cwd}
+cp -r "minikube-${version}" "${cwd}"

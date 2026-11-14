@@ -13,22 +13,12 @@
 # limitations under the License.
 
 mkdir -p out
-gsutil.cmd -m cp gs://minikube-builds/$env:MINIKUBE_LOCATION/minikube-windows-amd64.exe out/
-gsutil.cmd -m cp gs://minikube-builds/$env:MINIKUBE_LOCATION/e2e-windows-amd64.exe out/
-gsutil.cmd -m cp -r gs://minikube-builds/$env:MINIKUBE_LOCATION/testdata .
 
-./out/minikube-windows-amd64.exe delete
+gsutil.cmd -m cp -r gs://minikube-builds/$env:MINIKUBE_LOCATION/common.ps1 out/
 
-out/e2e-windows-amd64.exe -minikube-start-args="--driver=hyperv --hyperv-virtual-switch=primary-virtual-switch" -binary=out/minikube-windows-amd64.exe -test.v -test.timeout=65m
-$env:result=$lastexitcode
-# If the last exit code was 0->success, x>0->error
-If($env:result -eq 0){$env:status="success"}
-Else {$env:status="failure"}
+$driver="hyperv"
+$timeout="180m"
+$env:JOB_NAME="Hyper-V_Windows"
+$env:EXTERNAL="yes"
 
-# $env:SHORT_COMMIT=$env:COMMIT.substring(0, 7)
-# to be used later to implement https://github.com/kubernetes/minikube/issues/6593
-$env:target_url="https://storage.googleapis.com/minikube-builds/logs/$env:MINIKUBE_LOCATION/Hyper-V_Windows.txt"
-$json = "{`"state`": `"$env:status`", `"description`": `"Jenkins`", `"target_url`": `"$env:target_url`", `"context`": `"Hyper-V_Windows`"}"
-Invoke-WebRequest -Uri "https://api.github.com/repos/kubernetes/minikube/statuses/$env:COMMIT`?access_token=$env:access_token" -Body $json -ContentType "application/json" -Method Post -usebasicparsing
-
-Exit $env:result
+. ./out/common.ps1

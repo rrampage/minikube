@@ -17,44 +17,57 @@ limitations under the License.
 package cluster
 
 import (
-	"flag"
 	"fmt"
 
-	"github.com/docker/machine/libmachine"
-	"github.com/docker/machine/libmachine/ssh"
-	"github.com/pkg/errors"
+	"k8s.io/minikube/pkg/libmachine"
+	"k8s.io/minikube/pkg/libmachine/ssh"
 
 	"k8s.io/minikube/pkg/minikube/bootstrapper"
 	"k8s.io/minikube/pkg/minikube/bootstrapper/kubeadm"
+	"k8s.io/minikube/pkg/minikube/command"
 	"k8s.io/minikube/pkg/minikube/config"
-	"k8s.io/minikube/pkg/minikube/exit"
+	"k8s.io/minikube/pkg/minikube/machine"
 )
 
 // This init function is used to set the logtostderr variable to false so that INFO level log info does not clutter the CLI
-// INFO lvl logging is displayed due to the kubernetes api calling flag.Set("logtostderr", "true") in its init()
+// INFO lvl logging is displayed due to the Kubernetes api calling flag.Set("logtostderr", "true") in its init()
 // see: https://github.com/kubernetes/kubernetes/blob/master/pkg/kubectl/util/logs/logs.go#L32-L34
 func init() {
-	if err := flag.Set("logtostderr", "false"); err != nil {
-		exit.WithError("unable to set logtostderr", err)
-	}
-
 	// Setting the default client to native gives much better performance.
 	ssh.SetDefaultClient(ssh.Native)
 }
 
 // Bootstrapper returns a new bootstrapper for the cluster
-// TODO(#6891): Remove node as an argument
-func Bootstrapper(api libmachine.API, bootstrapperName string, cc config.ClusterConfig, n config.Node) (bootstrapper.Bootstrapper, error) {
+func Bootstrapper(api libmachine.API, bootstrapperName string, cc config.ClusterConfig, r command.Runner) (bootstrapper.Bootstrapper, error) {
 	var b bootstrapper.Bootstrapper
 	var err error
 	switch bootstrapperName {
 	case bootstrapper.Kubeadm:
-		b, err = kubeadm.NewBootstrapper(api, cc, n)
+		b, err = kubeadm.NewBootstrapper(api, cc, r)
 		if err != nil {
-			return nil, errors.Wrap(err, "getting a new kubeadm bootstrapper")
+			return nil, fmt.Errorf("getting a new kubeadm bootstrapper: %w", err)
 		}
 	default:
 		return nil, fmt.Errorf("unknown bootstrapper: %s", bootstrapperName)
 	}
 	return b, nil
+}
+
+// ControlPlaneBootstrapper returns a bootstrapper for the first available cluster control-plane node.
+func ControlPlaneBootstrapper(mAPI libmachine.API, cc *config.ClusterConfig, bootstrapperName string) (bootstrapper.Bootstrapper, error) {
+	cp, err := config.ControlPlane(*cc)
+	if err != nil {
+		return nil, fmt.Errorf("get primary control-plane node: %w", err)
+	}
+	h, err := machine.LoadHost(mAPI, config.MachineName(*cc, cp))
+	if err != nil {
+		return nil, fmt.Errorf("load primary control-plane host: %w", err)
+	}
+	cpr, err := machine.CommandRunner(h)
+	if err != nil {
+		return nil, fmt.Errorf("get primary control-plane command runner: %w", err)
+	}
+
+	bs, err := Bootstrapper(mAPI, bootstrapperName, *cc, cpr)
+	return bs, err
 }

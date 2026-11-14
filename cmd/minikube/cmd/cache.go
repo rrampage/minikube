@@ -18,21 +18,29 @@ package cmd
 
 import (
 	"github.com/spf13/cobra"
+	"github.com/spf13/viper"
+	"k8s.io/klog/v2"
 	cmdConfig "k8s.io/minikube/cmd/minikube/cmd/config"
+	"k8s.io/minikube/cmd/minikube/cmd/flags"
+	"k8s.io/minikube/pkg/minikube/config"
 	"k8s.io/minikube/pkg/minikube/exit"
 	"k8s.io/minikube/pkg/minikube/image"
 	"k8s.io/minikube/pkg/minikube/machine"
 	"k8s.io/minikube/pkg/minikube/node"
+	"k8s.io/minikube/pkg/minikube/out"
+	"k8s.io/minikube/pkg/minikube/reason"
 )
 
 // cacheImageConfigKey is the config field name used to store which images we have previously cached
 const cacheImageConfigKey = "cache"
 
+const allFlag = "all"
+
 // cacheCmd represents the cache command
 var cacheCmd = &cobra.Command{
 	Use:   "cache",
-	Short: "Add or delete an image from the local cache.",
-	Long:  "Add or delete an image from the local cache.",
+	Short: "Manage cache for images",
+	Long:  "Add an image into minikube as a local cache, or delete, reload the cached images",
 }
 
 // addCacheCmd represents the cache add command
@@ -40,16 +48,38 @@ var addCacheCmd = &cobra.Command{
 	Use:   "add",
 	Short: "Add an image to local cache.",
 	Long:  "Add an image to local cache.",
-	Run: func(cmd *cobra.Command, args []string) {
+	Run: func(_ *cobra.Command, args []string) {
+		out.WarningT("\"minikube cache\" will be deprecated in upcoming versions, please switch to \"minikube image load\"")
+		options := flags.CommandOptions()
 		// Cache and load images into docker daemon
-		if err := machine.CacheAndLoadImages(args); err != nil {
-			exit.WithError("Failed to cache and load images", err)
+		if err := machine.CacheAndLoadImages(args, cacheAddProfiles(), false, options); err != nil {
+			exit.Error(reason.InternalCacheLoad, "Failed to cache and load images", err)
 		}
 		// Add images to config file
 		if err := cmdConfig.AddToConfigMap(cacheImageConfigKey, args); err != nil {
-			exit.WithError("Failed to update config", err)
+			exit.Error(reason.InternalAddConfig, "Failed to update config", err)
 		}
 	},
+}
+
+func addCacheCmdFlags() {
+	addCacheCmd.Flags().Bool(allFlag, false, "Add image to cache for all running minikube clusters")
+}
+
+func cacheAddProfiles() []*config.Profile {
+	if viper.GetBool(allFlag) {
+		validProfiles, _, err := config.ListProfiles() // need to load image to all profiles
+		if err != nil {
+			klog.Warningf("error listing profiles: %v", err)
+		}
+		return validProfiles
+	}
+	profile := viper.GetString(config.ProfileName)
+	p, err := config.LoadProfile(profile)
+	if err != nil {
+		exit.Message(reason.Usage, "{{.profile}} profile is not valid: {{.err}}", out.V{"profile": profile, "err": err})
+	}
+	return []*config.Profile{p}
 }
 
 // deleteCacheCmd represents the cache delete command
@@ -57,14 +87,14 @@ var deleteCacheCmd = &cobra.Command{
 	Use:   "delete",
 	Short: "Delete an image from the local cache.",
 	Long:  "Delete an image from the local cache.",
-	Run: func(cmd *cobra.Command, args []string) {
+	Run: func(_ *cobra.Command, args []string) {
 		// Delete images from config file
 		if err := cmdConfig.DeleteFromConfigMap(cacheImageConfigKey, args); err != nil {
-			exit.WithError("Failed to delete images from config", err)
+			exit.Error(reason.InternalDelConfig, "Failed to delete images from config", err)
 		}
 		// Delete images from cache/images directory
 		if err := image.DeleteFromCacheDir(args); err != nil {
-			exit.WithError("Failed to delete images", err)
+			exit.Error(reason.HostDelCache, "Failed to delete images", err)
 		}
 	},
 }
@@ -74,15 +104,17 @@ var reloadCacheCmd = &cobra.Command{
 	Use:   "reload",
 	Short: "reload cached images.",
 	Long:  "reloads images previously added using the 'cache add' subcommand",
-	Run: func(cmd *cobra.Command, args []string) {
-		err := node.CacheAndLoadImagesInConfig()
+	Run: func(_ *cobra.Command, _ []string) {
+		options := flags.CommandOptions()
+		err := node.CacheAndLoadImagesInConfig(cacheAddProfiles(), options)
 		if err != nil {
-			exit.WithError("Failed to reload cached images", err)
+			exit.Error(reason.GuestCacheLoad, "Failed to reload cached images", err)
 		}
 	},
 }
 
 func init() {
+	addCacheCmdFlags()
 	cacheCmd.AddCommand(addCacheCmd)
 	cacheCmd.AddCommand(deleteCacheCmd)
 	cacheCmd.AddCommand(reloadCacheCmd)

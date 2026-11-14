@@ -17,22 +17,35 @@ limitations under the License.
 package node
 
 import (
+	"fmt"
+	"maps"
 	"os"
+	"path"
 	"runtime"
+	"slices"
+	"strings"
 
-	"github.com/golang/glog"
+	"k8s.io/minikube/pkg/minikube/detect"
+	"k8s.io/minikube/pkg/minikube/run"
+
+	"errors"
+
 	"github.com/spf13/viper"
 	"golang.org/x/sync/errgroup"
-	cmdcfg "k8s.io/minikube/cmd/minikube/cmd/config"
+	"k8s.io/klog/v2"
 	"k8s.io/minikube/pkg/drivers/kic"
 	"k8s.io/minikube/pkg/minikube/config"
 	"k8s.io/minikube/pkg/minikube/constants"
 	"k8s.io/minikube/pkg/minikube/download"
+	"k8s.io/minikube/pkg/minikube/driver"
 	"k8s.io/minikube/pkg/minikube/exit"
 	"k8s.io/minikube/pkg/minikube/image"
 	"k8s.io/minikube/pkg/minikube/localpath"
 	"k8s.io/minikube/pkg/minikube/machine"
 	"k8s.io/minikube/pkg/minikube/out"
+	"k8s.io/minikube/pkg/minikube/out/register"
+	"k8s.io/minikube/pkg/minikube/reason"
+	"k8s.io/minikube/pkg/minikube/style"
 )
 
 const (
@@ -40,16 +53,23 @@ const (
 	cacheImageConfigKey = "cache"
 )
 
-// BeginCacheKubernetesImages caches images required for kubernetes version in the background
-func beginCacheKubernetesImages(g *errgroup.Group, imageRepository string, k8sVersion string, cRuntime string) {
-	if download.PreloadExists(k8sVersion, cRuntime) {
-		glog.Info("Caching tarball of preloaded images")
-		err := download.Preload(k8sVersion, cRuntime)
+// BeginCacheKubernetesImages caches images required for Kubernetes version in the background
+func beginCacheKubernetesImages(g *errgroup.Group, imageRepository string, k8sVersion string, cRuntime string, driverName string) {
+	// Skip all caching operations in --no-kubernetes mode
+	if viper.GetBool("no-kubernetes") {
+		klog.Infof("Skipping Kubernetes image caching due to --no-kubernetes flag")
+		return
+	}
+
+	// TODO: remove imageRepository check once #7695 is fixed
+	if imageRepository == "" && download.PreloadExists(k8sVersion, cRuntime, driverName) {
+		klog.Info("Caching tarball of preloaded images")
+		err := download.Preload(k8sVersion, cRuntime, driverName)
 		if err == nil {
-			glog.Infof("Finished downloading the preloaded tar for %s on %s", k8sVersion, cRuntime)
+			klog.Infof("Finished verifying existence of preloaded tar for %s on %s", k8sVersion, cRuntime)
 			return // don't cache individual images if preload is successful.
 		}
-		glog.Warningf("Error downloading preloaded artifacts will continue without preload: %v", err)
+		klog.Warningf("Error downloading preloaded artifacts will continue without preload: %v", err)
 	}
 
 	if !viper.GetBool(cacheImages) {
@@ -57,73 +77,177 @@ func beginCacheKubernetesImages(g *errgroup.Group, imageRepository string, k8sVe
 	}
 
 	g.Go(func() error {
-		return machine.CacheImagesForBootstrapper(imageRepository, k8sVersion, viper.GetString(cmdcfg.Bootstrapper))
+		return machine.CacheImagesForBootstrapper(imageRepository, k8sVersion)
 	})
 }
 
-// HandleDownloadOnly caches appropariate binaries and images
-func handleDownloadOnly(cacheGroup, kicGroup *errgroup.Group, k8sVersion string) {
+// handleDownloadOnly caches appropariate binaries and images
+func handleDownloadOnly(cacheGroup, kicGroup *errgroup.Group, k8sVersion, containerRuntime, driverName string, options *run.CommandOptions) {
 	// If --download-only, complete the remaining downloads and exit.
-	if !viper.GetBool("download-only") {
+	if !options.DownloadOnly {
 		return
 	}
-	if err := doCacheBinaries(k8sVersion); err != nil {
-		exit.WithError("Failed to cache binaries", err)
-	}
-	if _, err := CacheKubectlBinary(k8sVersion); err != nil {
-		exit.WithError("Failed to cache kubectl", err)
+
+	binariesURL := viper.GetString("binary-mirror")
+
+	// Skip binary downloads in --no-kubernetes mode
+	if !viper.GetBool("no-kubernetes") {
+		if err := doCacheBinaries(k8sVersion, containerRuntime, driverName, binariesURL); err != nil {
+			exit.Error(reason.InetCacheBinaries, "Failed to cache binaries", err)
+		}
+		if _, err := CacheKubectlBinary(k8sVersion, binariesURL); err != nil {
+			exit.Error(reason.InetCacheKubectl, "Failed to cache kubectl", err)
+		}
 	}
 	waitCacheRequiredImages(cacheGroup)
-	waitDownloadKicArtifacts(kicGroup)
-	if err := saveImagesToTarFromConfig(); err != nil {
-		exit.WithError("Failed to cache images to tar", err)
+	if driver.IsKIC(driverName) {
+		waitDownloadKicBaseImage(kicGroup)
 	}
-	out.T(out.Check, "Download complete!")
-	os.Exit(0)
-
+	if err := saveImagesToTarFromConfig(); err != nil {
+		exit.Error(reason.InetCacheTar, "Failed to cache images to tar", err)
+	}
+	out.Step(style.Check, "Download complete!")
+	os.Exit(0) //nolint:revive
 }
 
 // CacheKubectlBinary caches the kubectl binary
-func CacheKubectlBinary(k8sVerison string) (string, error) {
+func CacheKubectlBinary(k8sVersion, binaryURL string) (string, error) {
 	binary := "kubectl"
 	if runtime.GOOS == "windows" {
 		binary = "kubectl.exe"
 	}
 
-	return download.Binary(binary, k8sVerison, runtime.GOOS, runtime.GOARCH)
+	return download.Binary(binary, k8sVersion, runtime.GOOS, runtime.GOARCH, binaryURL)
 }
 
 // doCacheBinaries caches Kubernetes binaries in the foreground
-func doCacheBinaries(k8sVersion string) error {
-	return machine.CacheBinariesForBootstrapper(k8sVersion, viper.GetString(cmdcfg.Bootstrapper))
+func doCacheBinaries(k8sVersion, containerRuntime, driverName, binariesURL string) error {
+	existingBinaries := constants.KubernetesReleaseBinaries
+	if !download.PreloadExists(k8sVersion, containerRuntime, driverName) {
+		existingBinaries = nil
+	}
+	return machine.CacheBinariesForBootstrapper(k8sVersion, existingBinaries, binariesURL)
 }
 
-// BeginDownloadKicArtifacts downloads the kic image + preload tarball, returns true if preload is available
-func beginDownloadKicArtifacts(g *errgroup.Group) {
-	out.T(out.Pulling, "Pulling base image ...")
-	glog.Info("Beginning downloading kic artifacts")
+// beginDownloadKicBaseImage downloads the kic image
+func beginDownloadKicBaseImage(g *errgroup.Group, cc *config.ClusterConfig, downloadOnly bool) {
+
+	klog.Infof("Beginning downloading kic base image for %s with %s", cc.Driver, cc.KubernetesConfig.ContainerRuntime)
+	register.Reg.SetStep(register.PullingBaseImage)
+	out.Step(style.Pulling, "Pulling base image {{.kicVersion}} ...", out.V{"kicVersion": kic.Version})
 	g.Go(func() error {
-		glog.Infof("Downloading %s to local daemon", kic.BaseImage)
-		return image.WriteImageToDaemon(kic.BaseImage)
+		baseImg := cc.KicBaseImage
+		if baseImg == kic.BaseImage && len(cc.KubernetesConfig.ImageRepository) != 0 {
+			baseImg = updateKicImageRepo(baseImg, cc.KubernetesConfig.ImageRepository)
+			cc.KicBaseImage = baseImg
+		}
+		var finalImg string
+		// If we end up using a fallback image, notify the user
+		defer func() {
+			if finalImg != "" {
+				cc.KicBaseImage = finalImg
+				if image.Tag(finalImg) != image.Tag(baseImg) {
+					out.WarningT(fmt.Sprintf("minikube was unable to download %s, but successfully downloaded %s as a fallback image", image.Tag(baseImg), finalImg))
+				}
+			}
+		}()
+		// first we try to download the kicbase image (and fall back images) from docker registry
+		var err error
+		for _, img := range append([]string{baseImg}, kic.FallbackImages...) {
+
+			if driver.IsDocker(cc.Driver) && download.ImageExistsInDaemon(img) && !downloadOnly {
+				klog.Infof("%s exists in daemon, skipping load", img)
+				finalImg = img
+				return nil
+			}
+
+			klog.Infof("Downloading %s to local cache", img)
+			err = download.ImageToCache(img)
+			if err == nil {
+				klog.Infof("successfully saved %s as a tarball", img)
+			}
+			if downloadOnly && err == nil {
+				return nil
+			}
+
+			if cc.Driver == driver.Podman {
+				return errors.New("not yet implemented, see issue #8426")
+			}
+			if driver.IsDocker(cc.Driver) && err == nil {
+				klog.Infof("Loading %s from local cache", img)
+				if finalImg, err = download.CacheToDaemon(img); err == nil {
+					klog.Infof("successfully loaded and using %s from cached tarball", img)
+					return nil
+				}
+			}
+			klog.Infof("failed to download %s, will try fallback image if available: %v", img, err)
+		}
+		// second if we failed to download any fallback image
+		// that means probably all registries are blocked by network issues
+		// we can try to download the image from minikube release page
+
+		// if we reach here, that means the user cannot have access to any docker registry
+		// this means the user is very likely to have a network issue
+		// downloading from github via http is the last resort, and we should remind the user
+		// that he should at least get access to github
+		// print essential warnings
+		out.WarningT("minikube cannot pull kicbase image from any docker registry, and is trying to download kicbase tarball from github release page via HTTP.")
+		out.WarningT("It's very likely that you have an internet issue. Please ensure that you can access the internet at least via HTTP, directly or with proxy. Currently your proxy configuration is:")
+		envs := []string{"HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "ALL_PROXY", "NO_PROXY"}
+		for _, env := range envs {
+			if v := os.Getenv(env); v != "" {
+				out.Infof("{{.env}}={{.value}}", out.V{"env": env, "value": v})
+			}
+		}
+		out.Ln("")
+
+		kicbaseVersion := strings.Split(kic.Version, "-")[0]
+		_, err = download.GHKicbaseTarballToCache(kicbaseVersion)
+		if err != nil {
+			klog.Infof("failed to download kicbase from github")
+			return errors.New("failed to download kic base image or any fallback image")
+		}
+
+		klog.Infof("successfully downloaded kicbase as fall back image from github")
+		if !downloadOnly && driver.IsDocker(cc.Driver) {
+			if finalImg, err = download.CacheToDaemon(fmt.Sprintf("kicbase/stable:%s", kicbaseVersion)); err == nil {
+				klog.Infof("successfully loaded and using kicbase from tarball on github")
+			} else {
+				return fmt.Errorf("failed to load kic base image into docker: %v", err)
+			}
+		}
+		return nil
+
 	})
 }
 
-// WaitDownloadKicArtifacts blocks until the required artifacts for KIC are downloaded.
-func waitDownloadKicArtifacts(g *errgroup.Group) {
+// waitDownloadKicBaseImage blocks until the base image for KIC is downloaded.
+func waitDownloadKicBaseImage(g *errgroup.Group) {
 	if err := g.Wait(); err != nil {
-		glog.Errorln("Error downloading kic artifacts: ", err)
-		return
+		if errors.Is(err, image.ErrGithubNeedsLogin) {
+			klog.Warningf("Error downloading kic artifacts: %v", err)
+			out.ErrT(style.Connectivity, "Unfortunately, could not download the base image {{.image_name}} ", out.V{"image_name": image.Tag(kic.BaseImage)})
+			out.WarningT("In order to use the fall back image, you need to log in to the github packages registry")
+			out.Styled(style.Documentation, `Please visit the following link for documentation around this:
+	https://help.github.com/en/packages/using-github-packages-with-your-projects-ecosystem/configuring-docker-for-use-with-github-packages#authenticating-to-github-packages
+`)
+		}
+		if errors.Is(err, image.ErrGithubNeedsLogin) || errors.Is(err, image.ErrNeedsLogin) {
+			exit.Message(reason.Usage, `Please either authenticate to the registry or use --base-image flag to use a different registry.`)
+		} else {
+			klog.Errorln("Error downloading kic artifacts: ", err)
+		}
 	}
-	glog.Info("Successfully downloaded all kic artifacts")
+	klog.Info("Successfully downloaded all kic artifacts")
 }
 
-// WaitCacheRequiredImages blocks until the required images are all cached.
+// waitCacheRequiredImages blocks until the required images are all cached.
 func waitCacheRequiredImages(g *errgroup.Group) {
 	if !viper.GetBool(cacheImages) {
 		return
 	}
 	if err := g.Wait(); err != nil {
-		glog.Errorln("Error caching images: ", err)
+		klog.Errorln("Error caching images: ", err)
 	}
 }
 
@@ -137,33 +261,45 @@ func saveImagesToTarFromConfig() error {
 	if len(images) == 0 {
 		return nil
 	}
-	return image.SaveToDir(images, constants.ImageCacheDir)
+	return image.SaveToDir(images, detect.ImageCacheDir(), false)
 }
 
 // CacheAndLoadImagesInConfig loads the images currently in the config file
 // called by 'start' and 'cache reload' commands.
-func CacheAndLoadImagesInConfig() error {
+func CacheAndLoadImagesInConfig(profiles []*config.Profile, options *run.CommandOptions) error {
 	images, err := imagesInConfigFile()
 	if err != nil {
-		return err
+		return fmt.Errorf("images: %w", err)
 	}
 	if len(images) == 0 {
 		return nil
 	}
-	return machine.CacheAndLoadImages(images)
+	return machine.CacheAndLoadImages(images, profiles, false, options)
 }
 
 func imagesInConfigFile() ([]string, error) {
 	configFile, err := config.ReadConfig(localpath.ConfigFile())
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("read: %w", err)
 	}
 	if values, ok := configFile[cacheImageConfigKey]; ok {
-		var images []string
-		for key := range values.(map[string]interface{}) {
-			images = append(images, key)
+		// Type assertion needed because config values are stored as interface{}
+		if m, ok := values.(map[string]interface{}); ok {
+			images := slices.Collect(maps.Keys(m))
+			return images, nil
 		}
-		return images, nil
+		return nil, fmt.Errorf("cache config value has unexpected type %T", values)
 	}
 	return []string{}, nil
+}
+
+func updateKicImageRepo(imgName string, repo string) string {
+	imageName := strings.TrimPrefix(imgName, "gcr.io/")
+	if repo == constants.AliyunMirror {
+		// for aliyun registry must strip namespace from image name, e.g.
+		//   registry.cn-hangzhou.aliyuncs.com/google_containers/k8s-minikube/kicbase:v0.0.25 will not work
+		//   registry.cn-hangzhou.aliyuncs.com/google_containers/kicbase:v0.0.25 does work
+		imageName = strings.TrimPrefix(imageName, "k8s-minikube/")
+	}
+	return path.Join(repo, imageName)
 }

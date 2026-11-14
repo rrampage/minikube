@@ -18,17 +18,17 @@ package cmd
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"os"
 
-	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 	"k8s.io/minikube/pkg/minikube/exit"
 	"k8s.io/minikube/pkg/minikube/out"
+	"k8s.io/minikube/pkg/minikube/reason"
 )
 
-const longDescription = `
-	Outputs minikube shell completion for the given shell (bash or zsh)
+const longDescription = `Outputs minikube shell completion for the given shell (bash, zsh, fish or powershell)
 
 	This depends on the bash-completion binary.  Example installation instructions:
 	OS X:
@@ -37,15 +37,28 @@ const longDescription = `
 		$ minikube completion bash > ~/.minikube-completion  # for bash users
 		$ minikube completion zsh > ~/.minikube-completion  # for zsh users
 		$ source ~/.minikube-completion
+		$ minikube completion fish > ~/.config/fish/completions/minikube.fish # for fish users
 	Ubuntu:
 		$ apt-get install bash-completion
-		$ source /etc/bash-completion
+		$ source /etc/bash_completion
 		$ source <(minikube completion bash) # for bash users
 		$ source <(minikube completion zsh) # for zsh users
+		$ minikube completion fish > ~/.config/fish/completions/minikube.fish # for fish users
 
 	Additionally, you may want to output the completion to a file and source in your .bashrc
 
+	Windows:
+		## Save completion code to a script and execute in the profile
+		PS> minikube completion powershell > $HOME\.minikube-completion.ps1
+		PS> Add-Content $PROFILE '. $HOME\.minikube-completion.ps1'
+
+		## Execute completion code in the profile
+		PS> Add-Content $PROFILE 'if (Get-Command minikube -ErrorAction SilentlyContinue) {
+		        minikube completion powershell | Out-String | Invoke-Expression
+		    }'
+
 	Note for zsh users: [1] zsh completions are only supported in versions of zsh >= 5.2
+	Note for fish users: [2] please refer to this docs for more details https://fishshell.com/docs/current/#tab-completion
 `
 
 const boilerPlate = `
@@ -66,27 +79,71 @@ const boilerPlate = `
 
 var completionCmd = &cobra.Command{
 	Use:   "completion SHELL",
-	Short: "Outputs minikube shell completion for the given shell (bash or zsh)",
+	Short: "Generate command completion for a shell",
 	Long:  longDescription,
-	Run: func(cmd *cobra.Command, args []string) {
+	Run: func(_ *cobra.Command, args []string) {
 		if len(args) != 1 {
-			exit.UsageT("Usage: minikube completion SHELL")
+			exit.Message(reason.Usage, "Usage: minikube completion SHELL")
 		}
-		if args[0] != "bash" && args[0] != "zsh" {
-			exit.UsageT("Sorry, completion support is not yet implemented for {{.name}}", out.V{"name": args[0]})
-		} else if args[0] == "bash" {
-			err := GenerateBashCompletion(os.Stdout, cmd.Parent())
-			if err != nil {
-				exit.WithError("bash completion failed", err)
-			}
-		} else {
-			err := GenerateZshCompletion(os.Stdout, cmd.Parent())
-			if err != nil {
-				exit.WithError("zsh completion failed", err)
-			}
+		if args[0] != "bash" && args[0] != "zsh" && args[0] != "fish" && args[0] != "powershell" {
+			exit.Message(reason.Usage, "Sorry, completion support is not yet implemented for {{.name}}", out.V{"name": args[0]})
 		}
-
 	},
+}
+
+var bashCmd = &cobra.Command{
+	Use:   "bash",
+	Short: "bash completion.",
+	Long:  "Generate command completion for bash.",
+	Run: func(cmd *cobra.Command, _ []string) {
+		err := GenerateBashCompletion(os.Stdout, cmd.Root())
+		if err != nil {
+			exit.Error(reason.InternalCompletion, "bash completion failed", err)
+		}
+	},
+}
+
+var zshCmd = &cobra.Command{
+	Use:   "zsh",
+	Short: "zsh completion.",
+	Long:  "Generate command completion for zsh.",
+	Run: func(cmd *cobra.Command, _ []string) {
+		err := GenerateZshCompletion(os.Stdout, cmd.Root())
+		if err != nil {
+			exit.Error(reason.InternalCompletion, "zsh completion failed", err)
+		}
+	},
+}
+
+var fishCmd = &cobra.Command{
+	Use:   "fish",
+	Short: "fish completion.",
+	Long:  "Generate command completion for fish .",
+	Run: func(cmd *cobra.Command, _ []string) {
+		err := GenerateFishCompletion(os.Stdout, cmd.Root())
+		if err != nil {
+			exit.Error(reason.InternalCompletion, "fish completion failed", err)
+		}
+	},
+}
+
+var powershellCmd = &cobra.Command{
+	Use:   "powershell",
+	Short: "powershell completion.",
+	Long:  "Generate command completion for PowerShell.",
+	Run: func(cmd *cobra.Command, _ []string) {
+		err := GeneratePowerShellCompletion(os.Stdout, cmd.Root())
+		if err != nil {
+			exit.Error(reason.InternalCompletion, "powershell completion failed", err)
+		}
+	},
+}
+
+func init() {
+	completionCmd.AddCommand(bashCmd)
+	completionCmd.AddCommand(zshCmd)
+	completionCmd.AddCommand(fishCmd)
+	completionCmd.AddCommand(powershellCmd)
 }
 
 // GenerateBashCompletion generates the completion for the bash shell
@@ -98,14 +155,14 @@ func GenerateBashCompletion(w io.Writer, cmd *cobra.Command) error {
 
 	err = cmd.GenBashCompletion(w)
 	if err != nil {
-		return errors.Wrap(err, "Error generating bash completion")
+		return fmt.Errorf("Error generating bash completion: %w", err)
 	}
 
 	return nil
 }
 
 // GenerateZshCompletion generates the completion for the zsh shell
-func GenerateZshCompletion(out io.Writer, cmd *cobra.Command) error {
+func GenerateZshCompletion(w io.Writer, cmd *cobra.Command) error {
 	zshAutoloadTag := `#compdef minikube
 `
 
@@ -239,20 +296,21 @@ __minikube_convert_bash_to_zsh() {
 	-e "s/${LWORD}compopt${RWORD}/__minikube_compopt/g" \
 	-e "s/${LWORD}declare${RWORD}/__minikube_declare/g" \
 	-e "s/\\\$(type${RWORD}/\$(__minikube_type/g" \
+	-e "s/aliashash\[\"\([a-z]*\)\"\]/aliashash[\1]/g" \
 	<<'BASH_COMPLETION_EOF'
 `
 
-	_, err := out.Write([]byte(zshAutoloadTag))
+	_, err := w.Write([]byte(zshAutoloadTag))
 	if err != nil {
 		return err
 	}
 
-	_, err = out.Write([]byte(boilerPlate))
+	_, err = w.Write([]byte(boilerPlate))
 	if err != nil {
 		return err
 	}
 
-	_, err = out.Write([]byte(zshInitialization))
+	_, err = w.Write([]byte(zshInitialization))
 	if err != nil {
 		return err
 	}
@@ -260,9 +318,9 @@ __minikube_convert_bash_to_zsh() {
 	buf := new(bytes.Buffer)
 	err = cmd.GenBashCompletion(buf)
 	if err != nil {
-		return errors.Wrap(err, "Error generating zsh completion")
+		return fmt.Errorf("Error generating zsh completion: %w", err)
 	}
-	_, err = out.Write(buf.Bytes())
+	_, err = w.Write(buf.Bytes())
 	if err != nil {
 		return err
 	}
@@ -272,9 +330,39 @@ BASH_COMPLETION_EOF
 }
 __minikube_bash_source <(__minikube_convert_bash_to_zsh)
 `
-	_, err = out.Write([]byte(zshTail))
+	_, err = w.Write([]byte(zshTail))
 	if err != nil {
 		return err
+	}
+
+	return nil
+}
+
+// GenerateFishCompletion generates the completion for the bash shell
+func GenerateFishCompletion(w io.Writer, cmd *cobra.Command) error {
+	_, err := w.Write([]byte(boilerPlate))
+	if err != nil {
+		return err
+	}
+
+	err = cmd.GenFishCompletion(w, true)
+	if err != nil {
+		return fmt.Errorf("Error generating fish completion: %w", err)
+	}
+
+	return nil
+}
+
+// GeneratePowerShellCompletion generates the completion for the PowerShell
+func GeneratePowerShellCompletion(w io.Writer, cmd *cobra.Command) error {
+	_, err := w.Write([]byte(boilerPlate))
+	if err != nil {
+		return err
+	}
+
+	err = cmd.GenPowerShellCompletionWithDesc(w)
+	if err != nil {
+		return fmt.Errorf("Error generating powershell completion: %w", err)
 	}
 
 	return nil

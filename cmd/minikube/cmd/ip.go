@@ -18,17 +18,31 @@ package cmd
 
 import (
 	"github.com/spf13/cobra"
+	"k8s.io/minikube/cmd/minikube/cmd/flags"
+	"k8s.io/minikube/pkg/minikube/exit"
 	"k8s.io/minikube/pkg/minikube/mustload"
+	"k8s.io/minikube/pkg/minikube/node"
 	"k8s.io/minikube/pkg/minikube/out"
+	"k8s.io/minikube/pkg/minikube/reason"
 )
 
 // ipCmd represents the ip command
 var ipCmd = &cobra.Command{
 	Use:   "ip",
-	Short: "Retrieves the IP address of the running cluster",
-	Long:  `Retrieves the IP address of the running cluster, and writes it to STDOUT.`,
-	Run: func(cmd *cobra.Command, args []string) {
-		co := mustload.Running(ClusterFlagValue())
-		out.Ln(co.CP.IP.String())
+	Short: "Retrieves the IP address of the specified node",
+	Long:  `Retrieves the IP address of the specified node, and writes it to STDOUT.`,
+	Run: func(_ *cobra.Command, _ []string) {
+		options := flags.CommandOptions()
+		co := mustload.Running(ClusterFlagValue(), options)
+		n, _, err := node.Retrieve(*co.Config, nodeName)
+		if err != nil {
+			exit.Error(reason.GuestNodeRetrieve, "retrieving node", err)
+		}
+
+		out.Ln(n.IP)
 	},
+}
+
+func init() {
+	ipCmd.Flags().StringVarP(&nodeName, "node", "n", "", "The node to get IP. Defaults to the primary control plane.")
 }

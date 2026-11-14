@@ -17,31 +17,33 @@ limitations under the License.
 package machine
 
 import (
-	"github.com/docker/machine/libmachine"
-	"github.com/docker/machine/libmachine/host"
-	"github.com/docker/machine/libmachine/state"
-	"github.com/golang/glog"
-	"github.com/pkg/errors"
+	"fmt"
+
+	"k8s.io/minikube/pkg/libmachine"
+	"k8s.io/minikube/pkg/libmachine/host"
+	"k8s.io/minikube/pkg/libmachine/state"
+
+	"k8s.io/klog/v2"
 )
 
 // Status returns the status of a libmachine host
 func Status(api libmachine.API, machineName string) (string, error) {
 	exists, err := api.Exists(machineName)
 	if err != nil {
-		return "", errors.Wrapf(err, "%s exists", machineName)
+		return "", fmt.Errorf("%s exists: %w", machineName, err)
 	}
 	if !exists {
 		return state.None.String(), nil
 	}
 
-	host, err := api.Load(machineName)
+	hostInfo, err := api.Load(machineName)
 	if err != nil {
-		return "", errors.Wrapf(err, "load")
+		return "", fmt.Errorf("load: %w", err)
 	}
 
-	s, err := host.Driver.GetState()
+	s, err := hostInfo.Driver.GetState()
 	if err != nil {
-		return "", errors.Wrap(err, "state")
+		return "", fmt.Errorf("state: %w", err)
 	}
 	return s.String(), nil
 }
@@ -50,11 +52,11 @@ func Status(api libmachine.API, machineName string) (string, error) {
 func IsRunning(api libmachine.API, name string) bool {
 	s, err := Status(api, name)
 	if err != nil {
-		glog.Warningf("host status for %q returned error: %v", name, err)
+		klog.Warningf("host status for %q returned error: %v", name, err)
 		return false
 	}
 	if s != state.Running.String() {
-		glog.Warningf("%q host status: %s", name, s)
+		klog.Warningf("%q host status: %s", name, s)
 		return false
 	}
 	return true
@@ -62,18 +64,18 @@ func IsRunning(api libmachine.API, name string) bool {
 
 // LoadHost returns a libmachine host by name
 func LoadHost(api libmachine.API, machineName string) (*host.Host, error) {
-	glog.Infof("Checking if %q exists ...", machineName)
+	klog.Infof("Checking if %q exists ...", machineName)
 	exists, err := api.Exists(machineName)
 	if err != nil {
-		return nil, errors.Wrapf(err, "Error checking that machine exists: %s", machineName)
+		return nil, fmt.Errorf("Error checking that machine exists: %s: %w", machineName, err)
 	}
 	if !exists {
-		return nil, errors.Errorf("machine %q does not exist", machineName)
+		return nil, fmt.Errorf("machine %q does not exist", machineName)
 	}
 
 	h, err := api.Load(machineName)
 	if err != nil {
-		return nil, errors.Wrapf(err, "loading machine %q", machineName)
+		return nil, fmt.Errorf("loading machine %q: %w", machineName, err)
 	}
 	return h, nil
 }

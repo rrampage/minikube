@@ -20,12 +20,14 @@ import (
 	"runtime"
 	"testing"
 
-	"github.com/docker/machine/libmachine/drivers"
-	"github.com/docker/machine/libmachine/mcnflag"
-	"github.com/docker/machine/libmachine/state"
-	"github.com/golang/glog"
-	"github.com/pkg/errors"
+	"errors"
+
+	"k8s.io/minikube/pkg/libmachine/drivers"
+	"k8s.io/minikube/pkg/libmachine/mcnflag"
+	"k8s.io/minikube/pkg/libmachine/state"
 	"k8s.io/minikube/pkg/minikube/constants"
+
+	"k8s.io/klog/v2"
 )
 
 // MockDriver is a struct used to mock out libmachine.Driver
@@ -43,7 +45,7 @@ type MockDriver struct {
 // Logf logs mock interactions
 func (d *MockDriver) Logf(format string, args ...interface{}) {
 	if d.T == nil {
-		glog.Infof(format, args...)
+		klog.Infof(format, args...)
 		return
 	}
 	d.T.Logf(format, args...)
@@ -67,8 +69,8 @@ func (d *MockDriver) GetIP() (string, error) {
 	if d.IP != "" {
 		return d.IP, nil
 	}
-	if d.BaseDriver.IPAddress != "" {
-		return d.BaseDriver.IPAddress, nil
+	if d.IPAddress != "" {
+		return d.IPAddress, nil
 	}
 	return "127.0.0.1", nil
 }
@@ -93,7 +95,7 @@ func (d *MockDriver) GetSSHHostname() (string, error) {
 
 // GetSSHKeyPath returns the key path for SSH
 func (d *MockDriver) GetSSHKeyPath() string {
-	return d.BaseDriver.SSHKeyPath
+	return d.SSHKeyPath
 }
 
 // GetState returns the state of the driver
@@ -140,7 +142,7 @@ func (d *MockDriver) Restart() error {
 }
 
 // SetConfigFromFlags sets the machine config
-func (d *MockDriver) SetConfigFromFlags(opts drivers.DriverOptions) error {
+func (d *MockDriver) SetConfigFromFlags(_ drivers.DriverOptions) error {
 	return nil
 }
 

@@ -16,7 +16,12 @@ limitations under the License.
 
 package addons
 
-import "testing"
+import (
+	"testing"
+
+	"k8s.io/minikube/pkg/minikube/config"
+	"k8s.io/minikube/pkg/minikube/run"
+)
 
 func TestIsAddonValid(t *testing.T) {
 	tests := []struct {
@@ -41,5 +46,27 @@ func TestIsAddonValid(t *testing.T) {
 				t.Fatalf("expected: %t\nactual:%t\n", test.isValid, valid)
 			}
 		})
+	}
+}
+
+func TestIsKVMDriverForNVIDIA(t *testing.T) {
+	tests := []struct {
+		cc        *config.ClusterConfig
+		wantError bool
+	}{
+		{
+			cc: &config.ClusterConfig{Driver: "kvm"},
+		},
+		{
+			cc:        &config.ClusterConfig{Driver: "docker"},
+			wantError: true,
+		},
+	}
+
+	for _, tc := range tests {
+		err := isKVMDriverForNVIDIA(tc.cc, "", "", &run.CommandOptions{})
+		if gotError := (err != nil); gotError != tc.wantError {
+			t.Errorf("isKVMDriverForNVIDIA(%v) got error %t (%v), want error %t", tc.cc, gotError, err, tc.wantError)
+		}
 	}
 }

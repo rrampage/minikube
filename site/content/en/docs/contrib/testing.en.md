@@ -6,7 +6,25 @@ description: >
   How to run tests
 ---
 
-### Unit Tests
+## Prerequisites
+
+- Go distribution
+  - Specific version depends on minikube version.
+  - The current dependency version can be found here : [master branch's go.mod file](https://github.com/kubernetes/minikube/blob/master/go.mod).
+- If you are on Linux, you will need to install `libvirt-dev`, since unit tests need kvm2 driver:
+
+```shell
+# For Debian based
+sudo apt-get install libvirt-dev
+
+# For Centos
+yum install libvirt-devel
+
+# For Fedora
+dnf install libvirt-devel
+```
+
+## Unit Tests
 
 Unit tests are run on Travis before code is merged. To run as part of a development cycle:
 
@@ -14,10 +32,11 @@ Unit tests are run on Travis before code is merged. To run as part of a developm
 make test
 ```
 
-### Integration Tests
+## Integration Tests
 
-Integration tests are currently run manually.
-To run them, build the binary and run the tests:
+### The basics
+
+From the minikube root directory, build the binary and run the tests:
 
 ```shell
 make integration
@@ -26,34 +45,62 @@ make integration
 You may find it useful to set various options to test only a particular test against a non-default driver. For instance:
 
 ```shell
- env TEST_ARGS="-minikube-start-args=--driver=hyperkit -test.run TestStartStop" make integration
- ```
+make integration TEST_ARGS="-minikube-start-args='--driver=vfkit --network=vmnet-shared' -test.run TestStartStop"
+```
 
-### Conformance Tests
+IMPORTANT:
+- To pass multiple flags to `-minikube-start-args` you must quote the value
+- flag values cannot contain space since the string is split by space
+
+### Quickly iterating on a single test
+
+Run a single test on an active cluster:
+
+```shell
+make integration TEST_ARGS="-test.run TestFunctional/parallel/MountCmd --profile=minikube --cleanup=false"
+```
+
+WARNING: For this to work repeatedly, the test must be written so that it cleans up after itself.
+
+The `--cleanup=false` test arg ensures that the cluster will not be deleted after the test is run.
+
+See [main_test.go](https://github.com/kubernetes/minikube/blob/master/test/integration/main_test.go) for details.
+
+### Disabling parallelism
+
+```shell
+make integration TEST_ARGS="-test.parallel=1"
+```
+
+### Testing philosophy
+
+- Tests should be so simple as to be correct by inspection
+- Readers should need to read only the test body to understand the test
+- Top-to-bottom readability is more important than code de-duplication
+
+Tests are typically read with a great air of skepticism, because chances are they are being read only when things are broken.
+
+## Conformance Tests
 
 These are Kubernetes tests that run against an arbitrary cluster and exercise a wide range of Kubernetes features.
 You can run these against minikube by following these steps:
 
-* Clone the Kubernetes repo somewhere on your system.
-* Run `make quick-release` in the k8s repo.
-* Start up a minikube cluster with: `minikube start`.
-* Set following two environment variables:
+Install [docker](https://docs.docker.com/engine/install/)
+Install [kubectl](https://v1-18.docs.kubernetes.io/docs/tasks/tools/install-kubectl/)
+Clone the [minikube repo](https://github.com/kubernetes/minikube)
 
-```shell
-export KUBECONFIG=$HOME/.kube/config
-export KUBERNETES_CONFORMANCE_TEST=y
+### Compile the latest minikube binary
+
+```console
+% cd <minikube dir>
+% make
 ```
 
-* Run the tests (from the k8s repo):
+### Trigger the tests and get back the results
 
-```shell
-go run hack/e2e.go -v --test --test_args="--ginkgo.focus=\[Conformance\]" --check-version-skew=false
+```console
+% cd <minikube dir>
+./hack/conformance_tests.sh out/minikube --driver=docker --container-runtime=docker --kubernetes-version=stable
 ```
 
-To run a specific conformance test, you can use the `ginkgo.focus` flag to filter the set using a regular expression.
-The `hack/e2e.go` wrapper and the `e2e.sh` wrappers have a little trouble with quoting spaces though, so use the `\s` regular expression character instead.
-For example, to run the test `should update annotations on modification [Conformance]`, use following command:
-
-```shell
-go run hack/e2e.go -v --test --test_args="--ginkgo.focus=should\supdate\sannotations\son\smodification" --check-version-skew=false
-```
+This script will run the latest sonobuoy against a minikube cluster with two nodes and the provided parameters.

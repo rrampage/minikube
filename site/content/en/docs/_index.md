@@ -11,15 +11,20 @@ minikube quickly sets up a local Kubernetes cluster on macOS, Linux, and Windows
 
 ![Screenshot](/images/screenshot.png)
 
+🎉 Latest Release: v1.39.0 - Sep 02, 2026 ([changelog](https://github.com/kubernetes/minikube/blob/master/CHANGELOG.md))
+
 ## Highlights
 
-* Supports the latest Kubernetes release (+6 previous minor versions)
+* Supports the latest Kubernetes release (+2 previous minor versions)
+* Supports GPUs for AI development ([nvidia]({{< ref "/docs/tutorials/nvidia.md" >}}), [amd]({{< ref "/docs/tutorials/amd.md" >}}), [apple]({{< ref "/docs/tutorials/ai-playground.md" >}}))
 * Cross-platform (Linux, macOS, Windows)
-* Deploy as a VM, a container, or on bare-metal
+* Deploy as a VM, a container, or on bare-metal or [try in your browser](https://codespaces.new/kubernetes/minikube?quickstart=1).
 * Multiple container runtimes (CRI-O, containerd, docker)
-* Docker API endpoint for blazing fast image pushes
-* Advanced features such as [LoadBalancer](https://minikube.sigs.k8s.io/Handbook/loadbalancer/), filesystem mounts, and FeatureGates
-* [Addons](https://minikube.sigs.k8s.io/Handbook/addons/) for easily installed Kubernetes applications
+* Direct API endpoint for blazing fast [image load and build]({{< ref "/docs/handbook/pushing.md" >}})
+* Advanced features such as [LoadBalancer]({{< ref "/docs/handbook/accessing.md#loadbalancer-access" >}}), filesystem mounts, FeatureGates, and [network policy]({{< ref "docs/handbook/network_policy.md" >}})
+* [Addons]({{< ref "/docs/handbook/deploying.md#addons" >}}) for easily installed Kubernetes applications
+* Supports common [CI environments](https://github.com/minikube-ci/examples)
+
 
 ## Survey
 

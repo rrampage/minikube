@@ -18,31 +18,33 @@ package driver
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
+	"k8s.io/minikube/pkg/minikube/config"
 	"k8s.io/minikube/pkg/minikube/registry"
+	"k8s.io/minikube/pkg/minikube/run"
 )
 
 func TestSupportedDrivers(t *testing.T) {
 	got := SupportedDrivers()
 	found := false
 	for _, s := range SupportedDrivers() {
-		if s == VirtualBox {
+		if s == SSH {
 			found = true
 		}
 	}
 
 	if found == false {
-		t.Errorf("%s not in supported drivers: %v", VirtualBox, got)
+		t.Errorf("%s not in supported drivers: %v", SSH, got)
 	}
 }
 
 func TestSupported(t *testing.T) {
-	if !Supported(VirtualBox) {
-		t.Errorf("Supported(%s) is false", VirtualBox)
+	if !Supported(SSH) {
+		t.Errorf("Supported(%s) is false", SSH)
 	}
 	if Supported("yabba?") {
 		t.Errorf("Supported(yabba?) is true")
@@ -60,17 +62,20 @@ func TestBareMetal(t *testing.T) {
 
 func TestMachineType(t *testing.T) {
 	types := map[string]string{
-		Podman:       "container",
-		Docker:       "container",
-		Mock:         "bare metal machine",
-		None:         "bare metal machine",
-		KVM2:         "VM",
-		VirtualBox:   "VM",
-		HyperKit:     "VM",
-		VMware:       "VM",
-		VMwareFusion: "VM",
-		HyperV:       "VM",
-		Parallels:    "VM",
+		Podman:     "container",
+		Docker:     "container",
+		Mock:       "bare metal machine",
+		None:       "bare metal machine",
+		SSH:        "bare metal machine",
+		KVM2:       "VM",
+		QEMU2:      "VM",
+		QEMU:       "VM",
+		VFKit:      "VM",
+		Krunkit:    "VM",
+		VirtualBox: "VM",
+		VMware:     "VM",
+		HyperV:     "VM",
+		Parallels:  "VM",
 	}
 
 	drivers := SupportedDrivers()
@@ -89,7 +94,7 @@ func TestFlagDefaults(t *testing.T) {
 		t.Errorf("defaults mismatch (-want +got):\n%s", diff)
 	}
 
-	tf, err := ioutil.TempFile("", "resolv.conf")
+	tf, err := os.CreateTemp("", "resolv.conf")
 	if err != nil {
 		t.Fatalf("tempfile: %v", err)
 	}
@@ -116,9 +121,11 @@ func TestSuggest(t *testing.T) {
 	}{
 		{
 			def: registry.DriverDef{
-				Name:     "unhealthy",
-				Priority: registry.Default,
-				Status:   func() registry.State { return registry.State{Installed: true, Healthy: false} },
+				Name:         "unhealthy",
+				Default:      true,
+				ProbeTimeout: 1 * time.Millisecond,
+				Priority:     registry.Default,
+				Status:       func(_ *run.CommandOptions) registry.State { return registry.State{Installed: true, Healthy: false} },
 			},
 			choices: []string{"unhealthy"},
 			pick:    "",
@@ -127,9 +134,11 @@ func TestSuggest(t *testing.T) {
 		},
 		{
 			def: registry.DriverDef{
-				Name:     "discouraged",
-				Priority: registry.Discouraged,
-				Status:   func() registry.State { return registry.State{Installed: true, Healthy: true} },
+				Name:         "discouraged",
+				Default:      false,
+				ProbeTimeout: 1 * time.Millisecond,
+				Priority:     registry.Discouraged,
+				Status:       func(_ *run.CommandOptions) registry.State { return registry.State{Installed: true, Healthy: true} },
 			},
 			choices: []string{"discouraged", "unhealthy"},
 			pick:    "",
@@ -138,9 +147,11 @@ func TestSuggest(t *testing.T) {
 		},
 		{
 			def: registry.DriverDef{
-				Name:     "default",
-				Priority: registry.Default,
-				Status:   func() registry.State { return registry.State{Installed: true, Healthy: true} },
+				Name:         "default",
+				Default:      true,
+				ProbeTimeout: 1 * time.Millisecond,
+				Priority:     registry.Default,
+				Status:       func(_ *run.CommandOptions) registry.State { return registry.State{Installed: true, Healthy: true} },
 			},
 			choices: []string{"default", "discouraged", "unhealthy"},
 			pick:    "default",
@@ -149,9 +160,11 @@ func TestSuggest(t *testing.T) {
 		},
 		{
 			def: registry.DriverDef{
-				Name:     "preferred",
-				Priority: registry.Preferred,
-				Status:   func() registry.State { return registry.State{Installed: true, Healthy: true} },
+				Name:         "preferred",
+				Default:      true,
+				ProbeTimeout: 1 * time.Millisecond,
+				Priority:     registry.Preferred,
+				Status:       func(_ *run.CommandOptions) registry.State { return registry.State{Installed: true, Healthy: true} },
 			},
 			choices: []string{"preferred", "default", "discouraged", "unhealthy"},
 			pick:    "preferred",
@@ -167,7 +180,7 @@ func TestSuggest(t *testing.T) {
 				}
 			}
 
-			got := Choices(false)
+			got := Choices(false, &run.CommandOptions{})
 			gotNames := []string{}
 			for _, c := range got {
 				gotNames = append(gotNames, c.Name)
@@ -199,5 +212,188 @@ func TestSuggest(t *testing.T) {
 			}
 
 		})
+	}
+}
+
+func TestIndexFromMachineName(t *testing.T) {
+	testCases := []struct {
+		Name        string
+		MachineName string
+		Want        int
+	}{
+		{
+			Name:        "default",
+			MachineName: "minikube",
+			Want:        1},
+		{
+			Name:        "second-node",
+			MachineName: "minikube-m02",
+			Want:        2},
+		{
+			Name:        "funny",
+			MachineName: "hahaha",
+			Want:        1},
+
+		{
+			Name:        "dash-profile",
+			MachineName: "my-dashy-minikube",
+			Want:        1},
+
+		{
+			Name:        "dash-profile-second-node",
+			MachineName: "my-dashy-minikube-m02",
+			Want:        2},
+		{
+			Name:        "michivious-user",
+			MachineName: "michivious-user-m02-m03",
+			Want:        3},
+		{
+			Name:        "third-node",
+			MachineName: "minikube-m3",
+			Want:        3},
+		{
+			Name:        "agent-node",
+			MachineName: "minikube-m007",
+			Want:        7},
+		{
+			Name:        "byte-0",
+			MachineName: "offline-docker-20210314040449-6655",
+			Want:        1},
+		{
+			Name:        "byte-255",
+			MachineName: "offline-docker-20210314040449-6654",
+			Want:        1},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.Name, func(t *testing.T) {
+			got := IndexFromMachineName(tc.MachineName)
+			if got != tc.Want {
+				t.Errorf("want order %d but got %d", tc.Want, got)
+
+			}
+		})
+
+	}
+}
+
+// test indexFroMachine against cluster config
+func TestIndexFromMachineNameClusterConfig(t *testing.T) {
+
+	testsCases := []struct {
+		ClusterConfig config.ClusterConfig
+		Want          int
+	}{
+		{
+			ClusterConfig: config.ClusterConfig{Name: "minikube",
+				Nodes: []config.Node{
+					{
+						Name:              "",
+						IP:                "172.17.0.3",
+						Port:              8443,
+						KubernetesVersion: "v1.19.2",
+						ControlPlane:      true,
+						Worker:            true,
+					},
+				},
+			},
+			Want: 1,
+		},
+
+		{
+			ClusterConfig: config.ClusterConfig{Name: "p2",
+				Nodes: []config.Node{
+					{
+						Name:              "",
+						IP:                "172.17.0.3",
+						Port:              8443,
+						KubernetesVersion: "v1.19.2",
+						ControlPlane:      true,
+						Worker:            true,
+					},
+					{
+						Name:              "m2",
+						IP:                "172.17.0.4",
+						Port:              0,
+						KubernetesVersion: "v1.19.2",
+						ControlPlane:      false,
+						Worker:            true,
+					},
+				},
+			},
+			Want: 2,
+		},
+
+		{
+			ClusterConfig: config.ClusterConfig{Name: "p3",
+				Nodes: []config.Node{
+					{
+						Name:              "",
+						IP:                "172.17.0.3",
+						Port:              8443,
+						KubernetesVersion: "v1.19.2",
+						ControlPlane:      true,
+						Worker:            true,
+					},
+					{
+						Name:              "m02",
+						IP:                "172.17.0.4",
+						Port:              0,
+						KubernetesVersion: "v1.19.2",
+						ControlPlane:      false,
+						Worker:            true,
+					},
+					{
+						Name:              "m03",
+						IP:                "172.17.0.5",
+						Port:              0,
+						KubernetesVersion: "v1.19.2",
+						ControlPlane:      false,
+						Worker:            true,
+					},
+				},
+			},
+			Want: 3,
+		},
+
+		{
+			ClusterConfig: config.ClusterConfig{Name: "offline-docker-20210314040449-6654",
+				Nodes: []config.Node{
+					{
+						Name:              "",
+						IP:                "172.17.0.3",
+						Port:              8443,
+						KubernetesVersion: "v1.19.2",
+						ControlPlane:      true,
+						Worker:            true,
+					},
+				},
+			},
+			Want: 1,
+		},
+
+		{
+			ClusterConfig: config.ClusterConfig{Name: "offline-docker-20210314040449-6655",
+				Nodes: []config.Node{
+					{
+						Name:              "",
+						IP:                "172.17.0.3",
+						Port:              8443,
+						KubernetesVersion: "v1.19.2",
+						ControlPlane:      true,
+						Worker:            true,
+					},
+				},
+			},
+			Want: 1,
+		},
+	}
+
+	for _, tc := range testsCases {
+		got := IndexFromMachineName(config.MachineName(tc.ClusterConfig, tc.ClusterConfig.Nodes[len(tc.ClusterConfig.Nodes)-1]))
+		if got != tc.Want {
+			t.Errorf("expected IndexFromMachineName to be %d but got %d", tc.Want, got)
+		}
+
 	}
 }
